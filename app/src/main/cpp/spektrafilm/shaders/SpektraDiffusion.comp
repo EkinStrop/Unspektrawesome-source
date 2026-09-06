@@ -1,0 +1,513 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+const float kLog10E = 0.4342944819032518;
+const uint kOpClear = 0u;
+const uint kOpBlurX = 1u;
+const uint kOpBlurYAccumulate = 2u;
+const uint kOpResolve = 3u;
+const uint kOpRawToLog = 4u;
+const uint kOpGroupBlurX = 5u;
+const uint kOpGroupBlurYAccumulate = 6u;
+const uint kOpDownsample = 7u;
+const uint kOpDownsampleBlurX = 8u;
+const uint kOpDownsampleBlurY = 9u;
+const uint kOpDownsampleUpsampleAccumulate = 10u;
+const uint kOpDownsampleGroupBlurX = 11u;
+const uint kOpDownsampleGroupBlurY = 12u;
+const uint kOpDownsampleGroupUpsampleAccumulate = 13u;
+
+layout(std430, binding = 0) readonly buffer SourcePixels {
+  vec4 sourcePixels[];
+};
+
+layout(std430, binding = 1) buffer TempPixels {
+  vec4 tempPixels[];
+};
+
+layout(std430, binding = 2) buffer AccumPixels {
+  vec4 accumPixels[];
+};
+
+layout(std430, binding = 3) buffer DestinationPixels {
+  vec4 destinationPixels[];
+};
+
+layout(std430, binding = 4) buffer DownsampleSourcePixels {
+  vec4 downsampleSourcePixels[];
+};
+
+layout(std430, binding = 5) buffer DownsampleTempPixels {
+  vec4 downsampleTempPixels[];
+};
+
+layout(std430, binding = 6) buffer DownsampleBlurPixels {
+  vec4 downsampleBlurPixels[];
+};
+
+layout(std430, binding = 27) readonly buffer DiffusionInfo {
+  uint componentCount;
+  float scatterFraction;
+  uint _infoPad0;
+  uint _infoPad1;
+} diffusionInfo;
+
+layout(std430, binding = 28) readonly buffer DiffusionComponents {
+  vec4 components[];
+};
+
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint operation;
+  uint componentIndex;
+  uint _pad2;
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+
+vec4 loadSourcePixel(uint index) { return sourcePixels[index]; }
+vec4 loadTempPixel(uint index) { return tempPixels[index]; }
+vec4 loadAccumPixel(uint index) { return accumPixels[index]; }
+vec4 loadDownsampleSourcePixel(uint index) { return downsampleSourcePixels[index]; }
+vec4 loadDownsampleTempPixel(uint index) { return downsampleTempPixels[index]; }
+vec4 loadDownsampleBlurPixel(uint index) { return downsampleBlurPixels[index]; }
+void storeTempPixel(uint index, vec4 value) { tempPixels[index] = value; }
+void storeAccumPixel(uint index, vec4 value) { accumPixels[index] = value; }
+void storeDestinationPixel(uint index, vec4 value) { destinationPixels[index] = value; }
+void storeDownsampleSourcePixel(uint index, vec4 value) { downsampleSourcePixels[index] = value; }
+void storeDownsampleTempPixel(uint index, vec4 value) { downsampleTempPixels[index] = value; }
+void storeDownsampleBlurPixel(uint index, vec4 value) { downsampleBlurPixels[index] = value; }
+
+uint groupCountFromPacked(uint packedValue) {
+  return max(packedValue & 0xffffu, 1u);
+}
+
+uint downsampleScaleFromPacked(uint packedValue) {
+  return max(packedValue >> 16u, 1u);
+}
+
+uint divCeil(uint value, uint divisor) {
+  divisor = max(divisor, 1u);
+  return (value + divisor - 1u) / divisor;
+}
+
+uint fullWidthSafe() {
+  return max(params.fullWidth, max(params.width, 1u));
+}
+
+uint fullHeightSafe() {
+  return max(params.fullHeight, max(params.height, 1u));
+}
+
+uint tileEndX() {
+  return min(params.tileOriginX + params.width, fullWidthSafe());
+}
+
+uint tileEndY() {
+  return min(params.tileOriginY + params.height, fullHeightSafe());
+}
+
+uint downsampleStartX(uint scale) {
+  return params.tileOriginX / max(scale, 1u);
+}
+
+uint downsampleStartY(uint scale) {
+  return params.tileOriginY / max(scale, 1u);
+}
+
+uint downsampleWidth(uint scale) {
+  const uint start = downsampleStartX(scale);
+  const uint end = divCeil(tileEndX(), scale);
+  return max(end > start ? end - start : 0u, 1u);
+}
+
+uint downsampleHeight(uint scale) {
+  const uint start = downsampleStartY(scale);
+  const uint end = divCeil(tileEndY(), scale);
+  return max(end > start ? end - start : 0u, 1u);
+}
+
+uint groupedIndex(uint baseIndex, uint plane, uint planePixelCount) {
+  return plane * planePixelCount + baseIndex;
+}
+
+uint safeIndex(int index, uint size) {
+  if (size <= 1u) {
+    return 0u;
+  }
+  return uint(clamp(index, 0, int(size) - 1));
+}
+
+vec4 sampleSource(int x, int y) {
+  const uint sx = safeIndex(x, params.width);
+  const uint sy = safeIndex(y, params.height);
+  return loadSourcePixel(sy * params.width + sx);
+}
+
+vec4 sampleTemp(int x, int y) {
+  const uint sx = safeIndex(x, params.width);
+  const uint sy = safeIndex(y, params.height);
+  return loadTempPixel(sy * params.width + sx);
+}
+
+vec4 sampleGroupedTemp(int x, int y, uint plane) {
+  const uint sx = safeIndex(x, params.width);
+  const uint sy = safeIndex(y, params.height);
+  return loadTempPixel(groupedIndex(sy * params.width + sx, plane, params.width * params.height));
+}
+
+vec4 sampleDownsampleSource(int x, int y, uint reducedWidth, uint reducedHeight) {
+  const uint sx = safeIndex(x, reducedWidth);
+  const uint sy = safeIndex(y, reducedHeight);
+  return loadDownsampleSourcePixel(sy * reducedWidth + sx);
+}
+
+vec4 sampleDownsampleTemp(int x, int y, uint plane, uint reducedWidth, uint reducedHeight) {
+  const uint sx = safeIndex(x, reducedWidth);
+  const uint sy = safeIndex(y, reducedHeight);
+  return loadDownsampleTempPixel(groupedIndex(sy * reducedWidth + sx, plane, reducedWidth * reducedHeight));
+}
+
+vec4 sampleDownsampleBlur(int x, int y, uint plane, uint reducedWidth, uint reducedHeight) {
+  const uint sx = safeIndex(x, reducedWidth);
+  const uint sy = safeIndex(y, reducedHeight);
+  return loadDownsampleBlurPixel(groupedIndex(sy * reducedWidth + sx, plane, reducedWidth * reducedHeight));
+}
+
+vec4 downsampleSource(uvec2 gid, uint scale) {
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  const uint baseX = (downsampleStartX(scale) + gid.x) * scale;
+  const uint baseY = (downsampleStartY(scale) + gid.y) * scale;
+  for (uint y = 0u; y < scale; ++y) {
+    for (uint x = 0u; x < scale; ++x) {
+      const uint fullX = min(baseX + x, fullWidthSafe() - 1u);
+      const uint fullY = min(baseY + y, fullHeightSafe() - 1u);
+      const uint sx = safeIndex(int(fullX) - int(params.tileOriginX), params.width);
+      const uint sy = safeIndex(int(fullY) - int(params.tileOriginY), params.height);
+      value += loadSourcePixel(sy * params.width + sx);
+      weightSum += 1.0;
+    }
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 gaussianSampleSourceX(uvec2 gid, float sigma) {
+  if (sigma <= 1.0e-4) {
+    return sampleSource(int(gid.x), int(gid.y));
+  }
+
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  float weight = exp(-0.5 * invSigma2);
+  float ratio = exp(-1.5 * invSigma2);
+  const float ratioStep = exp(-invSigma2);
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  vec4 value = sampleSource(x, y);
+  float weightSum = 1.0;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = sampleSource(x - offset, y) + sampleSource(x + offset, y);
+    value.rgb += samplePair.rgb * weight;
+    value.a += samplePair.a;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  value.rgb /= max(weightSum, 1.0e-8);
+  value.a /= float(radius * 2 + 1);
+  return value;
+}
+
+vec4 gaussianSampleTempY(uvec2 gid, float sigma) {
+  if (sigma <= 1.0e-4) {
+    return sampleTemp(int(gid.x), int(gid.y));
+  }
+
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  float weight = exp(-0.5 * invSigma2);
+  float ratio = exp(-1.5 * invSigma2);
+  const float ratioStep = exp(-invSigma2);
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  vec4 value = sampleTemp(x, y);
+  float weightSum = 1.0;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = sampleTemp(x, y - offset) + sampleTemp(x, y + offset);
+    value.rgb += samplePair.rgb * weight;
+    value.a += samplePair.a;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  value.rgb /= max(weightSum, 1.0e-8);
+  value.a /= float(radius * 2 + 1);
+  return value;
+}
+
+vec4 gaussianSampleSourceXComponent(uvec2 gid, uint componentIndex) {
+  const vec4 component = components[min(componentIndex, max(diffusionInfo.componentCount, 1u) - 1u)];
+  return gaussianSampleSourceX(gid, max(component.x, 1.0e-6));
+}
+
+vec4 gaussianSampleTempYComponent(uvec2 gid, uint componentIndex) {
+  const vec4 component = components[min(componentIndex, max(diffusionInfo.componentCount, 1u) - 1u)];
+  const vec4 blurred = gaussianSampleTempY(gid, max(component.x, 1.0e-6));
+  return vec4(blurred.rgb * component.yzw, blurred.a);
+}
+
+vec4 gaussianSampleGroupedTempY(uvec2 gid, uint componentIndex, uint plane) {
+  const vec4 component = components[min(componentIndex, max(diffusionInfo.componentCount, 1u) - 1u)];
+  const float sigma = max(component.x, 1.0e-6);
+  if (sigma <= 1.0e-4) {
+    return sampleGroupedTemp(int(gid.x), int(gid.y), plane);
+  }
+
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  float weight = exp(-0.5 * invSigma2);
+  float ratio = exp(-1.5 * invSigma2);
+  const float ratioStep = exp(-invSigma2);
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  vec4 value = sampleGroupedTemp(x, y, plane);
+  float weightSum = 1.0;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = sampleGroupedTemp(x, y - offset, plane) + sampleGroupedTemp(x, y + offset, plane);
+    value.rgb += samplePair.rgb * weight;
+    value.a += samplePair.a;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  value.rgb /= max(weightSum, 1.0e-8);
+  value.a /= float(radius * 2 + 1);
+  return value;
+}
+
+vec4 gaussianSampleDownsampleSourceX(uvec2 gid, uint componentIndex, uint scale, uint reducedWidth, uint reducedHeight) {
+  const vec4 component = components[min(componentIndex, max(diffusionInfo.componentCount, 1u) - 1u)];
+  const float sigma = max(component.x / float(max(scale, 1u)), 1.0e-6);
+  if (sigma <= 1.0e-4) {
+    return sampleDownsampleSource(int(gid.x), int(gid.y), reducedWidth, reducedHeight);
+  }
+
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  float weight = exp(-0.5 * invSigma2);
+  float ratio = exp(-1.5 * invSigma2);
+  const float ratioStep = exp(-invSigma2);
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  vec4 value = sampleDownsampleSource(x, y, reducedWidth, reducedHeight);
+  float weightSum = 1.0;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = sampleDownsampleSource(x - offset, y, reducedWidth, reducedHeight) +
+      sampleDownsampleSource(x + offset, y, reducedWidth, reducedHeight);
+    value.rgb += samplePair.rgb * weight;
+    value.a += samplePair.a;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  value.rgb /= max(weightSum, 1.0e-8);
+  value.a /= float(radius * 2 + 1);
+  return value;
+}
+
+vec4 gaussianSampleDownsampleTempY(uvec2 gid, uint componentIndex, uint plane, uint scale, uint reducedWidth, uint reducedHeight) {
+  const vec4 component = components[min(componentIndex, max(diffusionInfo.componentCount, 1u) - 1u)];
+  const float sigma = max(component.x / float(max(scale, 1u)), 1.0e-6);
+  if (sigma <= 1.0e-4) {
+    return sampleDownsampleTemp(int(gid.x), int(gid.y), plane, reducedWidth, reducedHeight);
+  }
+
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  float weight = exp(-0.5 * invSigma2);
+  float ratio = exp(-1.5 * invSigma2);
+  const float ratioStep = exp(-invSigma2);
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  vec4 value = sampleDownsampleTemp(x, y, plane, reducedWidth, reducedHeight);
+  float weightSum = 1.0;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = sampleDownsampleTemp(x, y - offset, plane, reducedWidth, reducedHeight) +
+      sampleDownsampleTemp(x, y + offset, plane, reducedWidth, reducedHeight);
+    value.rgb += samplePair.rgb * weight;
+    value.a += samplePair.a;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  value.rgb /= max(weightSum, 1.0e-8);
+  value.a /= float(radius * 2 + 1);
+  return value;
+}
+
+void main() {
+  const uvec2 dispatchGid = gl_GlobalInvocationID.xy;
+  if (params.operation == kOpDownsample) {
+    const uvec2 gid = dispatchGid;
+    const uint scale = max(params.componentIndex, 1u);
+    const uint reducedWidth = downsampleWidth(scale);
+    const uint reducedHeight = downsampleHeight(scale);
+    if (gid.x >= reducedWidth || gid.y >= reducedHeight) {
+      return;
+    }
+    storeDownsampleSourcePixel(gid.y * reducedWidth + gid.x, downsampleSource(gid, scale));
+    return;
+  }
+  if (params.operation == kOpDownsampleBlurX || params.operation == kOpDownsampleGroupBlurX) {
+    const uvec2 gid = dispatchGid;
+    const uint groupCount = params.operation == kOpDownsampleGroupBlurX ? groupCountFromPacked(params._pad2) : 1u;
+    const uint scale = downsampleScaleFromPacked(params._pad2);
+    const uint reducedWidth = downsampleWidth(scale);
+    const uint reducedHeight = downsampleHeight(scale);
+    if (gid.x >= reducedWidth || gid.y >= reducedHeight) {
+      return;
+    }
+    const uint planePixelCount = reducedWidth * reducedHeight;
+    const uint reducedIndex = gid.y * reducedWidth + gid.x;
+    for (uint group = 0u; group < groupCount; ++group) {
+      const uint componentIndex = min(params.componentIndex + group, max(diffusionInfo.componentCount, 1u) - 1u);
+      storeDownsampleTempPixel(
+        groupedIndex(reducedIndex, group, planePixelCount),
+        gaussianSampleDownsampleSourceX(gid, componentIndex, scale, reducedWidth, reducedHeight)
+      );
+    }
+    return;
+  }
+  if (params.operation == kOpDownsampleBlurY || params.operation == kOpDownsampleGroupBlurY) {
+    const uvec2 gid = dispatchGid;
+    const uint groupCount = params.operation == kOpDownsampleGroupBlurY ? groupCountFromPacked(params._pad2) : 1u;
+    const uint scale = downsampleScaleFromPacked(params._pad2);
+    const uint reducedWidth = downsampleWidth(scale);
+    const uint reducedHeight = downsampleHeight(scale);
+    if (gid.x >= reducedWidth || gid.y >= reducedHeight) {
+      return;
+    }
+    const uint planePixelCount = reducedWidth * reducedHeight;
+    const uint reducedIndex = gid.y * reducedWidth + gid.x;
+    for (uint group = 0u; group < groupCount; ++group) {
+      const uint componentIndex = min(params.componentIndex + group, max(diffusionInfo.componentCount, 1u) - 1u);
+      storeDownsampleBlurPixel(
+        groupedIndex(reducedIndex, group, planePixelCount),
+        gaussianSampleDownsampleTempY(gid, componentIndex, group, scale, reducedWidth, reducedHeight)
+      );
+    }
+    return;
+  }
+
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (dispatchGid.x >= activeWidth || dispatchGid.y >= activeHeight) {
+    return;
+  }
+  const uvec2 gid = dispatchGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (gid.x >= params.width || gid.y >= params.height) {
+    return;
+  }
+
+  const uint index = gid.y * params.width + gid.x;
+  if (params.operation == kOpClear) {
+    storeAccumPixel(index, vec4(0.0, 0.0, 0.0, loadSourcePixel(index).a));
+    return;
+  }
+  if (params.operation == kOpBlurX) {
+    const vec4 component = components[min(params.componentIndex, max(diffusionInfo.componentCount, 1u) - 1u)];
+    storeTempPixel(index, gaussianSampleSourceX(gid, max(component.x, 1.0e-6)));
+    return;
+  }
+  if (params.operation == kOpBlurYAccumulate) {
+    const vec4 component = components[min(params.componentIndex, max(diffusionInfo.componentCount, 1u) - 1u)];
+    const vec4 blurred = gaussianSampleTempY(gid, max(component.x, 1.0e-6));
+    storeAccumPixel(index, vec4(loadAccumPixel(index).rgb + blurred.rgb * component.yzw, blurred.a));
+    return;
+  }
+  if (params.operation == kOpGroupBlurX) {
+    const uint groupCount = max(params._pad2, 1u);
+    const uint planePixelCount = params.width * params.height;
+    for (uint group = 0u; group < groupCount; ++group) {
+      const uint componentIndex = min(params.componentIndex + group, max(diffusionInfo.componentCount, 1u) - 1u);
+      tempPixels[groupedIndex(index, group, planePixelCount)] = gaussianSampleSourceXComponent(gid, componentIndex);
+    }
+    return;
+  }
+  if (params.operation == kOpGroupBlurYAccumulate) {
+    const uint groupCount = max(params._pad2, 1u);
+    const uint planePixelCount = params.width * params.height;
+    vec3 accumulated = loadAccumPixel(index).rgb;
+    float alpha = loadSourcePixel(index).a;
+    for (uint group = 0u; group < groupCount; ++group) {
+      const uint componentIndex = min(params.componentIndex + group, max(diffusionInfo.componentCount, 1u) - 1u);
+      const vec4 component = components[componentIndex];
+      const vec4 blurred = gaussianSampleGroupedTempY(gid, componentIndex, group);
+      accumulated += blurred.rgb * component.yzw;
+      alpha = blurred.a;
+    }
+    storeAccumPixel(index, vec4(accumulated, alpha));
+    return;
+  }
+  if (params.operation == kOpDownsampleUpsampleAccumulate || params.operation == kOpDownsampleGroupUpsampleAccumulate) {
+    const uint groupCount = params.operation == kOpDownsampleGroupUpsampleAccumulate ? groupCountFromPacked(params._pad2) : 1u;
+    const uint scale = downsampleScaleFromPacked(params._pad2);
+    const uint reducedWidth = downsampleWidth(scale);
+    const uint reducedHeight = downsampleHeight(scale);
+    const vec2 absoluteGid = vec2(gid + uvec2(params.tileOriginX, params.tileOriginY));
+    const vec2 reducedPos = (absoluteGid + vec2(0.5)) / float(scale) - vec2(0.5);
+    const ivec2 baseGlobal = ivec2(floor(reducedPos));
+    const ivec2 base = baseGlobal -
+      ivec2(int(downsampleStartX(scale)), int(downsampleStartY(scale)));
+    const vec2 t = clamp(reducedPos - vec2(baseGlobal), vec2(0.0), vec2(1.0));
+    vec3 accumulated = loadAccumPixel(index).rgb;
+    float alpha = loadSourcePixel(index).a;
+    for (uint group = 0u; group < groupCount; ++group) {
+      const uint componentIndex = min(params.componentIndex + group, max(diffusionInfo.componentCount, 1u) - 1u);
+      const vec4 component = components[componentIndex];
+      const vec4 s00 = sampleDownsampleBlur(base.x, base.y, group, reducedWidth, reducedHeight);
+      const vec4 s10 = sampleDownsampleBlur(base.x + 1, base.y, group, reducedWidth, reducedHeight);
+      const vec4 s01 = sampleDownsampleBlur(base.x, base.y + 1, group, reducedWidth, reducedHeight);
+      const vec4 s11 = sampleDownsampleBlur(base.x + 1, base.y + 1, group, reducedWidth, reducedHeight);
+      const vec4 sx0 = mix(s00, s10, t.x);
+      const vec4 sx1 = mix(s01, s11, t.x);
+      const vec4 upsampled = mix(sx0, sx1, t.y);
+      accumulated += upsampled.rgb * component.yzw;
+      alpha = upsampled.a;
+    }
+    storeAccumPixel(index, vec4(accumulated, alpha));
+    return;
+  }
+  if (params.operation == kOpResolve) {
+    const vec4 raw = loadSourcePixel(index);
+    const float scatter = clamp(diffusionInfo.scatterFraction, 0.0, 0.99);
+    storeDestinationPixel(index, vec4(mix(raw.rgb, loadAccumPixel(index).rgb, scatter), raw.a));
+    return;
+  }
+  if (params.operation == kOpRawToLog) {
+    const vec4 raw = loadSourcePixel(index);
+    storeDestinationPixel(index, vec4(log(max(raw.rgb, vec3(0.0)) + vec3(1.0e-10)) * kLog10E, raw.a));
+  }
+}

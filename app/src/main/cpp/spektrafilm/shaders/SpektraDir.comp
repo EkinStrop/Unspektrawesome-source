@@ -1,0 +1,329 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+const uint kOpCorrectionFromDensity = 0u;
+const uint kOpBlurX = 1u;
+const uint kOpBlurYStore = 2u;
+const uint kOpTailClear = 3u;
+const uint kOpTailBlurX = 4u;
+const uint kOpTailBlurYAccumulate = 5u;
+const uint kOpRedevelop = 6u;
+
+const uint kDirMatrix = 0u;
+const uint kDirDensityMax = 9u;
+const uint kDirBaseSigma = 12u;
+const uint kDirTailSigma = 13u;
+const uint kDirTailWeight = 16u;
+const uint kDirFilmPositive = 17u;
+
+layout(std430, binding = 0) readonly buffer Input0 {
+  vec4 in0[];
+};
+
+layout(std430, binding = 1) buffer Buffer1 {
+  vec4 buf1[];
+};
+
+layout(std430, binding = 2) readonly buffer Input2 {
+  vec4 in2[];
+};
+
+layout(std430, binding = 3) buffer Buffer3 {
+  vec4 buf3[];
+};
+
+layout(std430, binding = 4) readonly buffer LogExposure {
+  vec2 curveExposure[];
+};
+
+layout(std430, binding = 5) readonly buffer DensityCurves {
+  float densityCurves[];
+};
+
+layout(std430, binding = 27) readonly buffer DirFloats {
+  float dirFloats[];
+};
+
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint operation;
+  uint component;
+  uint _pad2;
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+
+vec4 loadInput0(uint index) { return in0[index]; }
+vec4 loadInput2(uint index) { return in2[index]; }
+vec4 loadBuffer1(uint index) { return buf1[index]; }
+void storeBuffer1(uint index, vec4 value) { buf1[index] = value; }
+void storeBuffer3(uint index, vec4 value) { buf3[index] = value; }
+
+uint safeIndex(int index, uint size) {
+  if (size <= 1u) {
+    return 0u;
+  }
+  return uint(clamp(index, 0, int(size) - 1));
+}
+
+vec4 sampleInput0(int x, int y) {
+  const uint sx = safeIndex(x, params.width);
+  const uint sy = safeIndex(y, params.height);
+  return loadInput0(sy * params.width + sx);
+}
+
+float sigmaForMode() {
+  if (params.operation == kOpTailBlurX || params.operation == kOpTailBlurYAccumulate) {
+    return max(dirFloats[kDirTailSigma + min(params.component, 2u)], 0.0);
+  }
+  return max(dirFloats[kDirBaseSigma], 0.0);
+}
+
+vec4 gaussianSampleInput0(uvec2 gid, float sigma) {
+  if (sigma <= 1.0e-4) {
+    return sampleInput0(int(gid.x), int(gid.y));
+  }
+
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  const bool horizontal = params.operation == kOpBlurX || params.operation == kOpTailBlurX;
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  float weight = exp(-0.5 * invSigma2);
+  float ratio = exp(-1.5 * invSigma2);
+  const float ratioStep = exp(-invSigma2);
+  vec4 value = sampleInput0(x, y);
+  float weightSum = 1.0;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = horizontal
+      ? sampleInput0(x - offset, y) + sampleInput0(x + offset, y)
+      : sampleInput0(x, y - offset) + sampleInput0(x, y + offset);
+    value += samplePair * weight;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+float interpDensityCurve(float logRaw, uint channel) {
+  const uint count = params.exposureCount;
+  if (count == 0u) {
+    return 0.0;
+  }
+  const float lookupRaw = params.filmGamma == 1.0 ? logRaw : logRaw * max(params.filmGamma, 1.0e-6);
+  const float firstX = curveExposure[0].x;
+  const float lastX = curveExposure[count - 1u].x;
+  if (lookupRaw <= firstX) {
+    return densityCurves[channel];
+  }
+  if (lookupRaw >= lastX) {
+    return densityCurves[(count - 1u) * 3u + channel];
+  }
+
+  uint lo = 0u;
+  uint hi = count - 1u;
+  while (hi - lo > 1u) {
+    const uint mid = (lo + hi) >> 1u;
+    if (curveExposure[mid].x <= lookupRaw) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+
+  const float x0 = curveExposure[lo].x;
+  const float y0 = densityCurves[lo * 3u + channel];
+  const float y1 = densityCurves[hi * 3u + channel];
+  const float t = clamp((lookupRaw - x0) * curveExposure[lo].y, 0.0, 1.0);
+  return mix(y0, y1, t);
+}
+
+float developmentActivity(float stops) {
+  const float clampedStops = clamp(stops, -2.0, 2.0);
+  float developmentSeconds = 180.0;
+  if (clampedStops < 0.0) {
+    developmentSeconds = mix(180.0, 150.0, min(-clampedStops, 1.0));
+  } else if (clampedStops <= 1.0) {
+    developmentSeconds = mix(180.0, 220.0, clampedStops);
+  } else {
+    developmentSeconds = mix(220.0, 280.0, clampedStops - 1.0);
+  }
+  return log(developmentSeconds / 180.0);
+}
+
+float pushPullSpeedGain(float stops) {
+  if (stops > 0.0) {
+    const float pushOne = mix(0.0, 0.33, min(stops, 1.0));
+    return stops <= 1.0 ? pushOne : mix(0.33, 0.5, min(stops - 1.0, 1.0));
+  }
+  if (stops < 0.0) {
+    return mix(0.0, -0.2, min(-stops, 1.0));
+  }
+  return 0.0;
+}
+
+float sigmoid(float u) {
+  return 1.0 / (1.0 + exp(-u));
+}
+
+float pushPullWarpLogRaw(float logRaw, uint channel, float stops) {
+  const float activity = developmentActivity(stops);
+  const float signedActivitySquared = activity * abs(activity);
+  const vec3 toeLinear = vec3(0.0);
+  const vec3 midLinear = vec3(0.25, 0.28, 0.31);
+  const vec3 shoulderLinear = vec3(0.32, 0.38, 0.45);
+  const vec3 toeQuadratic = vec3(0.0);
+  const vec3 midQuadratic = vec3(0.04, 0.06, 0.08);
+  const vec3 shoulderQuadratic = vec3(0.08, 0.12, 0.16);
+  const float toeMask = 1.0 - sigmoid((logRaw + 2.0) / 0.5);
+  const float shoulderMask = sigmoid(logRaw / 0.5);
+  const float midMask = max(1.0 - toeMask - shoulderMask, 0.0);
+  const int channelIndex = int(channel);
+  const float toeShift = toeLinear[channelIndex] * activity + toeQuadratic[channelIndex] * signedActivitySquared;
+  const float midShift = midLinear[channelIndex] * activity + midQuadratic[channelIndex] * signedActivitySquared;
+  const float shoulderShift = shoulderLinear[channelIndex] * activity + shoulderQuadratic[channelIndex] * signedActivitySquared;
+  return logRaw + toeShift * toeMask + midShift * midMask + shoulderShift * shoulderMask;
+}
+
+vec3 experimentalPushPullLogRaw(vec3 logRaw, float stops) {
+  vec3 shifted = logRaw - vec3((stops - pushPullSpeedGain(stops)) * 0.3010299956639812);
+  const float activity = developmentActivity(stops);
+  const float meanLogRaw = (shifted.r + shifted.g + shifted.b) / 3.0;
+  const mat3 coupling = mat3(
+    vec3(0.0, -0.015, 0.015),
+    vec3(0.015, 0.0, -0.015),
+    vec3(-0.015, 0.015, 0.0)
+  );
+  shifted += activity * (coupling * (shifted - vec3(meanLogRaw)));
+  return vec3(
+    pushPullWarpLogRaw(shifted.r, 0u, stops),
+    pushPullWarpLogRaw(shifted.g, 1u, stops),
+    pushPullWarpLogRaw(shifted.b, 2u, stops)
+  );
+}
+
+float experimentalPushPullDensityGain(float logRaw, uint channel, float stops) {
+  const float activity = developmentActivity(stops);
+  const float signedActivitySquared = activity * abs(activity);
+  const vec3 buildLinear = vec3(1.05, 0.95, 1.00);
+  const vec3 buildQuadratic = vec3(-0.90, -0.82, -0.86);
+  const float toeMask = 1.0 - sigmoid((logRaw + 2.0) / 0.5);
+  const float shoulderMask = sigmoid(logRaw / 0.5);
+  const float midMask = max(1.0 - toeMask - shoulderMask, 0.0);
+  const float regionWeight = 0.12 * toeMask + midMask + shoulderMask;
+  const int channelIndex = int(channel);
+  const float build = buildLinear[channelIndex] * activity + buildQuadratic[channelIndex] * signedActivitySquared;
+  return clamp(1.0 + build * regionWeight, 0.35, 2.0);
+}
+
+vec3 developFilmDensity(vec3 logRaw) {
+  if (params.filmPushPullMode == 1) {
+    const vec3 lookupRaw = experimentalPushPullLogRaw(logRaw, params.filmPushPullStops);
+    const vec3 density = vec3(
+      interpDensityCurve(lookupRaw.r, 0u),
+      interpDensityCurve(lookupRaw.g, 1u),
+      interpDensityCurve(lookupRaw.b, 2u)
+    );
+    return density * vec3(
+      experimentalPushPullDensityGain(lookupRaw.r, 0u, params.filmPushPullStops),
+      experimentalPushPullDensityGain(lookupRaw.g, 1u, params.filmPushPullStops),
+      experimentalPushPullDensityGain(lookupRaw.b, 2u, params.filmPushPullStops)
+    );
+  }
+  return vec3(
+    interpDensityCurve(logRaw.r, 0u),
+    interpDensityCurve(logRaw.g, 1u),
+    interpDensityCurve(logRaw.b, 2u)
+  );
+}
+
+vec3 silverDensity(vec3 densityCmy) {
+  if (dirFloats[kDirFilmPositive] > 0.5) {
+    return max(vec3(
+      dirFloats[kDirDensityMax],
+      dirFloats[kDirDensityMax + 1u],
+      dirFloats[kDirDensityMax + 2u]
+    ) - densityCmy, vec3(0.0));
+  }
+  return max(densityCmy, vec3(0.0));
+}
+
+vec3 correctionFromDensity(vec3 densityCmy) {
+  const vec3 silver = silverDensity(densityCmy);
+  return vec3(
+    silver.r * dirFloats[kDirMatrix] + silver.g * dirFloats[kDirMatrix + 3u] + silver.b * dirFloats[kDirMatrix + 6u],
+    silver.r * dirFloats[kDirMatrix + 1u] + silver.g * dirFloats[kDirMatrix + 4u] + silver.b * dirFloats[kDirMatrix + 7u],
+    silver.r * dirFloats[kDirMatrix + 2u] + silver.g * dirFloats[kDirMatrix + 5u] + silver.b * dirFloats[kDirMatrix + 8u]
+  );
+}
+
+float tailAmplitude(uint component) {
+  return component == 0u ? 0.1633 : (component == 1u ? 0.6496 : 0.1870);
+}
+
+void main() {
+  const uvec2 activeGid = gl_GlobalInvocationID.xy;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {
+    return;
+  }
+
+  const uvec2 gid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (gid.x >= params.width || gid.y >= params.height) {
+    return;
+  }
+  const uint index = gid.y * params.width + gid.x;
+  if (params.operation == kOpCorrectionFromDensity) {
+    const vec4 density = loadInput0(index);
+    storeBuffer1(index, vec4(correctionFromDensity(density.rgb), density.a));
+    return;
+  }
+  if (params.operation == kOpBlurX || params.operation == kOpBlurYStore || params.operation == kOpTailBlurX) {
+    storeBuffer1(index, gaussianSampleInput0(gid, sigmaForMode()));
+    return;
+  }
+  if (params.operation == kOpTailClear) {
+    const float tailWeight = clamp(dirFloats[kDirTailWeight], 0.0, 1.0);
+    const vec4 input0 = loadInput0(index);
+    storeBuffer1(index, vec4(input0.rgb * (1.0 - tailWeight), input0.a));
+    return;
+  }
+  if (params.operation == kOpTailBlurYAccumulate) {
+    const float tailWeight = clamp(dirFloats[kDirTailWeight], 0.0, 1.0);
+    const vec4 blurred = gaussianSampleInput0(gid, sigmaForMode());
+    storeBuffer1(index, vec4(
+      loadBuffer1(index).rgb + tailWeight * tailAmplitude(params.component) * blurred.rgb,
+      blurred.a
+    ));
+    return;
+  }
+  if (params.operation == kOpRedevelop) {
+    const vec4 logRaw = loadInput0(index);
+    const vec3 correctedLogRaw = logRaw.rgb - loadInput2(index).rgb;
+    const vec3 density = developFilmDensity(correctedLogRaw);
+    storeBuffer3(index, vec4(max(density, vec3(0.0)), logRaw.a));
+  }
+}

@@ -1,0 +1,61 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "raw_input.glsl"
+#include "raw_color.glsl"
+#include "frame_geometry.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D previewOutput;
+
+float averageAxial(ivec2 center)
+{
+    return 0.25 * (rawNormalized(center + ivec2(-1, 0)) +
+                   rawNormalized(center + ivec2( 1, 0)) +
+                   rawNormalized(center + ivec2( 0,-1)) +
+                   rawNormalized(center + ivec2( 0, 1)));
+}
+
+float averageDiagonal(ivec2 center)
+{
+    return 0.25 * (rawNormalized(center + ivec2(-1,-1)) +
+                   rawNormalized(center + ivec2( 1,-1)) +
+                   rawNormalized(center + ivec2(-1, 1)) +
+                   rawNormalized(center + ivec2( 1, 1)));
+}
+
+vec3 bilinearDemosaic(ivec2 center)
+{
+    int centerColor = cfaColor(center);
+    float centerValue = rawNormalized(center);
+
+    if (centerColor == CFA_RED)
+        return vec3(centerValue, averageAxial(center), averageDiagonal(center));
+    if (centerColor == CFA_BLUE)
+        return vec3(averageDiagonal(center), averageAxial(center), centerValue);
+
+    bool redIsHorizontal = cfaColor(center + ivec2(1, 0)) == CFA_RED;
+    float horizontal = 0.5 * (rawNormalized(center + ivec2(-1, 0)) +
+                              rawNormalized(center + ivec2( 1, 0)));
+    float vertical = 0.5 * (rawNormalized(center + ivec2(0, -1)) +
+                            rawNormalized(center + ivec2(0,  1)));
+    return redIsHorizontal
+        ? vec3(horizontal, centerValue, vertical)
+        : vec3(vertical, centerValue, horizontal);
+}
+
+void main()
+{
+    ivec2 outputPosition = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(outputPosition, rawParams.dimensions.zw)))
+        return;
+
+    vec2 sourceUv = geometrySourceUv(outputPosition);
+    ivec2 rawPosition = geometrySourcePosition(
+        outputPosition, rawParams.dimensions.xy);
+    vec2 lensShadingUv = geometryLensShadingUv(sourceUv);
+    vec3 processed = rawColorProcess(
+        bilinearDemosaic(rawPosition), lensShadingUv,
+        float(rawParams.layoutInfo.w));
+    imageStore(previewOutput, outputPosition, vec4(processed, 1.0));
+}

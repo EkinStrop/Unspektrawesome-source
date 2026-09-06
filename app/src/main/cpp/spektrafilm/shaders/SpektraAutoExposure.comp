@@ -1,0 +1,225 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SourcePixels {
+  vec4 src[];
+};
+
+layout(std430, binding = 5) readonly buffer ColorDecodeLuts {
+  float colorDecodeLuts[];
+};
+
+layout(std430, binding = 6) readonly buffer ColorTransferKinds {
+  uint colorTransferKinds[];
+};
+
+layout(std430, binding = 8) readonly buffer InputMeterXyzMatrices {
+  float inputMeterXyz[];
+};
+
+layout(std430, binding = 29) buffer AutoExposureLuminance {
+  float luminance[];
+};
+
+layout(std430, binding = 30) buffer AutoExposureResult {
+  float autoExposureEv[];
+};
+
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint _pad0;
+  uint _pad1;
+  uint _pad2;
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+
+shared float sharedWeightedSum[256];
+shared float sharedWeightSum[256];
+shared uint sharedCounts[256];
+shared uint selectedPrefix;
+shared uint selectedRank;
+
+uint colorSpaceIndex() {
+  return uint(clamp(params.inputColorSpace, 0, int(max(params.colorSpaceCount, 1u)) - 1));
+}
+
+float sampleDecodeLut(float value, uint colorSpace) {
+  const uint lutSize = max(params.transferLutSize, 2u);
+  const float range = max(params.colorDecodeMax - params.colorDecodeMin, 1.0e-6);
+  const float step = range / float(lutSize - 1u);
+  const uint offset = colorSpace * lutSize;
+  if (value <= params.colorDecodeMin) {
+    const float y0 = colorDecodeLuts[offset];
+    const float y1 = colorDecodeLuts[offset + 1u];
+    return y0 + (value - params.colorDecodeMin) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+  if (value >= params.colorDecodeMax) {
+    const float y0 = colorDecodeLuts[offset + lutSize - 2u];
+    const float y1 = colorDecodeLuts[offset + lutSize - 1u];
+    return y1 + (value - params.colorDecodeMax) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+  const float position =
+    ((value - params.colorDecodeMin) / range) * float(lutSize - 1u);
+  const uint lo = uint(floor(position));
+  const uint hi = min(lo + 1u, lutSize - 1u);
+  return mix(
+    colorDecodeLuts[offset + lo],
+    colorDecodeLuts[offset + hi],
+    position - float(lo)
+  );
+}
+
+float meterLuminance(vec3 rgb, uint colorSpace) {
+  if (colorTransferKinds[colorSpace] != 0u) {
+    rgb = vec3(
+      sampleDecodeLut(rgb.r, colorSpace),
+      sampleDecodeLut(rgb.g, colorSpace),
+      sampleDecodeLut(rgb.b, colorSpace)
+    );
+  }
+  const uint matrixOffset = colorSpace * 9u;
+  return inputMeterXyz[matrixOffset + 3u] * rgb.r +
+         inputMeterXyz[matrixOffset + 4u] * rgb.g +
+         inputMeterXyz[matrixOffset + 5u] * rgb.b;
+}
+
+uint orderedFloatKey(float value) {
+  const uint bits = floatBitsToUint(value);
+  return (bits & 0x80000000u) != 0u ? ~bits : bits ^ 0x80000000u;
+}
+
+float floatFromOrderedKey(uint key) {
+  const uint bits = (key & 0x80000000u) != 0u ? key ^ 0x80000000u : ~key;
+  return uintBitsToFloat(bits);
+}
+
+uint selectOrderedKey(uint rank, uint sampleCount) {
+  const uint lane = gl_LocalInvocationIndex;
+  if (lane == 0u) {
+    selectedPrefix = 0u;
+    selectedRank = rank;
+  }
+  barrier();
+
+  uint prefixMask = 0u;
+  for (int bit = 31; bit >= 0; --bit) {
+    const uint bitMask = 1u << uint(bit);
+    uint localCount = 0u;
+    for (uint index = lane; index < sampleCount; index += 256u) {
+      const uint key = orderedFloatKey(luminance[index]);
+      if ((key & prefixMask) == selectedPrefix && (key & bitMask) == 0u) {
+        ++localCount;
+      }
+    }
+    sharedCounts[lane] = localCount;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+      if (lane < stride) {
+        sharedCounts[lane] += sharedCounts[lane + stride];
+      }
+      barrier();
+    }
+
+    if (lane == 0u) {
+      if (selectedRank >= sharedCounts[0]) {
+        selectedPrefix |= bitMask;
+        selectedRank -= sharedCounts[0];
+      }
+    }
+    barrier();
+    prefixMask |= bitMask;
+  }
+  return selectedPrefix;
+}
+
+void main() {
+  const uint lane = gl_LocalInvocationIndex;
+  const uint sourceWidth = max(params.fullWidth, 1u);
+  const uint sourceHeight = max(params.fullHeight, 1u);
+  const uint longEdge = max(sourceWidth, sourceHeight);
+  const uint previewWidth = longEdge <= 256u
+    ? sourceWidth
+    : max(1u, uint(floor(float(sourceWidth) * 256.0 / float(longEdge) + 0.5)));
+  const uint previewHeight = longEdge <= 256u
+    ? sourceHeight
+    : max(1u, uint(floor(float(sourceHeight) * 256.0 / float(longEdge) + 0.5)));
+  const uint sampleCount = previewWidth * previewHeight;
+  const uint colorSpace = colorSpaceIndex();
+
+  for (uint index = lane; index < sampleCount; index += 256u) {
+    const uint x = index % previewWidth;
+    const uint y = index / previewWidth;
+    const uint sourceX = min(sourceWidth - 1u, (x * sourceWidth) / previewWidth);
+    const uint sourceY = min(sourceHeight - 1u, (y * sourceHeight) / previewHeight);
+    luminance[index] = meterLuminance(src[sourceY * sourceWidth + sourceX].rgb, colorSpace);
+  }
+  memoryBarrierBuffer();
+  barrier();
+
+  float meteredY = 0.0;
+  if (params._pad0 == 1u) {
+    const uint midpoint = sampleCount / 2u;
+    const float upper = floatFromOrderedKey(selectOrderedKey(midpoint, sampleCount));
+    meteredY = upper;
+    if ((sampleCount & 1u) == 0u) {
+      const float lower = floatFromOrderedKey(selectOrderedKey(midpoint - 1u, sampleCount));
+      meteredY = 0.5 * (lower + upper);
+    }
+  } else {
+    const float longestPreviewEdge = float(max(previewWidth, previewHeight));
+    const float normX = float(previewWidth) / longestPreviewEdge;
+    const float normY = float(previewHeight) / longestPreviewEdge;
+    float weightedSum = 0.0;
+    float weightSum = 0.0;
+    for (uint index = lane; index < sampleCount; index += 256u) {
+      const uint x = index % previewWidth;
+      const uint y = index / previewWidth;
+      const float xf = (float(x) / float(previewWidth) - 0.5) * normX;
+      const float yf = (float(y) / float(previewHeight) - 0.5) * normY;
+      const float weight = exp(-(xf * xf + yf * yf) / 0.08);
+      weightedSum += luminance[index] * weight;
+      weightSum += weight;
+    }
+    sharedWeightedSum[lane] = weightedSum;
+    sharedWeightSum[lane] = weightSum;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+      if (lane < stride) {
+        sharedWeightedSum[lane] += sharedWeightedSum[lane + stride];
+        sharedWeightSum[lane] += sharedWeightSum[lane + stride];
+      }
+      barrier();
+    }
+    meteredY = sharedWeightedSum[0] / max(sharedWeightSum[0], 1.0e-30);
+  }
+
+  if (lane == 0u) {
+    const float exposure = meteredY / 0.184;
+    const float ev = exposure > 0.0 ? -log2(exposure) : 0.0;
+    autoExposureEv[0] = (isnan(ev) || isinf(ev)) ? 0.0 : ev;
+  }
+}

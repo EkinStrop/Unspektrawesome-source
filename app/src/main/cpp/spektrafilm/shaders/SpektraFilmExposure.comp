@@ -1,0 +1,271 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+const float kLog10E = 0.4342944819032518;
+const uint kColorAdaptationInputCompression = 1u << 0u;
+const uint kAutoExposureEnabled = 1u << 31u;
+
+layout(std430, binding = 0) readonly buffer SourcePixels {
+  vec4 src[];
+};
+
+layout(std430, binding = 1) writeonly buffer FilmRawPixels {
+  vec4 filmRaw[];
+};
+
+layout(std430, binding = 4) readonly buffer InputToSrgbMatrices {
+  float inputToSrgb[];
+};
+
+layout(std430, binding = 5) readonly buffer ColorDecodeLuts {
+  float colorDecodeLuts[];
+};
+
+layout(std430, binding = 6) readonly buffer ColorTransferKinds {
+  uint colorTransferKinds[];
+};
+
+layout(std430, binding = 7) readonly buffer MallettRawMatrix {
+  float mallettRawMatrix[];
+};
+
+layout(std430, binding = 8) readonly buffer InputToReferenceXyzMatrices {
+  float inputToReferenceXyz[];
+};
+
+layout(std430, binding = 9) readonly buffer HanatosRawResponse {
+  vec4 hanatosRawResponse[];
+};
+
+layout(std430, binding = 30) readonly buffer AutoExposureResult {
+  float autoExposureEv[];
+};
+
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint _pad0;
+  uint _pad1;
+  uint _pad2;
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+
+vec4 loadSourcePixel(uint index) {
+  return src[index];
+}
+
+void storeFilmRawPixel(uint index, vec4 value) {
+  filmRaw[index] = value;
+}
+
+uint colorSpaceIndex() {
+  return uint(clamp(params.inputColorSpace, 0, int(max(params.colorSpaceCount, 1u)) - 1));
+}
+
+bool colorAdaptationEnabled(uint flag) {
+  return (params._pad1 & flag) != 0u;
+}
+
+float sampleDecodeLut(float value, uint colorSpace) {
+  const uint lutSize = max(params.transferLutSize, 2u);
+  const float decodeMin = params.colorDecodeMin;
+  const float decodeMax = params.colorDecodeMax;
+  const float range = max(decodeMax - decodeMin, 1.0e-6);
+  const float step = range / float(lutSize - 1u);
+  const uint offset = colorSpace * lutSize;
+  if (value <= decodeMin) {
+    const float y0 = colorDecodeLuts[offset];
+    const float y1 = colorDecodeLuts[offset + 1u];
+    return y0 + (value - decodeMin) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+  if (value >= decodeMax) {
+    const float y0 = colorDecodeLuts[offset + lutSize - 2u];
+    const float y1 = colorDecodeLuts[offset + lutSize - 1u];
+    return y1 + (value - decodeMax) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+
+  const float position = ((value - decodeMin) / range) * float(lutSize - 1u);
+  const uint lo = uint(floor(position));
+  const uint hi = min(lo + 1u, lutSize - 1u);
+  const float t = position - float(lo);
+  return mix(colorDecodeLuts[offset + lo], colorDecodeLuts[offset + hi], t);
+}
+
+vec3 decodeInputRgb(vec3 rgb, uint colorSpace) {
+  if (colorTransferKinds[colorSpace] == 0u) {
+    return rgb;
+  }
+  return vec3(
+    sampleDecodeLut(rgb.r, colorSpace),
+    sampleDecodeLut(rgb.g, colorSpace),
+    sampleDecodeLut(rgb.b, colorSpace)
+  );
+}
+
+vec3 multiplyInputToSrgb(vec3 rgb, uint colorSpace) {
+  const uint matrixOffset = colorSpace * 9u;
+  return vec3(
+    inputToSrgb[matrixOffset] * rgb.r + inputToSrgb[matrixOffset + 1u] * rgb.g + inputToSrgb[matrixOffset + 2u] * rgb.b,
+    inputToSrgb[matrixOffset + 3u] * rgb.r + inputToSrgb[matrixOffset + 4u] * rgb.g + inputToSrgb[matrixOffset + 5u] * rgb.b,
+    inputToSrgb[matrixOffset + 6u] * rgb.r + inputToSrgb[matrixOffset + 7u] * rgb.g + inputToSrgb[matrixOffset + 8u] * rgb.b
+  );
+}
+
+vec3 multiplyInputToReferenceXyz(vec3 rgb, uint colorSpace) {
+  const uint matrixOffset = colorSpace * 9u;
+  return vec3(
+    inputToReferenceXyz[matrixOffset] * rgb.r + inputToReferenceXyz[matrixOffset + 1u] * rgb.g + inputToReferenceXyz[matrixOffset + 2u] * rgb.b,
+    inputToReferenceXyz[matrixOffset + 3u] * rgb.r + inputToReferenceXyz[matrixOffset + 4u] * rgb.g + inputToReferenceXyz[matrixOffset + 5u] * rgb.b,
+    inputToReferenceXyz[matrixOffset + 6u] * rgb.r + inputToReferenceXyz[matrixOffset + 7u] * rgb.g + inputToReferenceXyz[matrixOffset + 8u] * rgb.b
+  );
+}
+
+vec3 mallettRaw(vec3 linearSrgb) {
+  const vec3 srgb = max(linearSrgb, vec3(0.0));
+  return vec3(
+    mallettRawMatrix[0u] * srgb.r + mallettRawMatrix[1u] * srgb.g + mallettRawMatrix[2u] * srgb.b,
+    mallettRawMatrix[3u] * srgb.r + mallettRawMatrix[4u] * srgb.g + mallettRawMatrix[5u] * srgb.b,
+    mallettRawMatrix[6u] * srgb.r + mallettRawMatrix[7u] * srgb.g + mallettRawMatrix[8u] * srgb.b
+  );
+}
+
+float mitchellWeight(float t) {
+  const float B = 1.0 / 3.0;
+  const float C = 1.0 / 3.0;
+  const float x = abs(t);
+  if (x < 1.0) {
+    return (1.0 / 6.0) * ((12.0 - 9.0 * B - 6.0 * C) * x * x * x +
+                          (-18.0 + 12.0 * B + 6.0 * C) * x * x +
+                          (6.0 - 2.0 * B));
+  }
+  if (x < 2.0) {
+    return (1.0 / 6.0) * ((-B - 6.0 * C) * x * x * x +
+                          (6.0 * B + 30.0 * C) * x * x +
+                          (-12.0 * B - 48.0 * C) * x +
+                          (8.0 * B + 24.0 * C));
+  }
+  return 0.0;
+}
+
+uint safeIndex(int index, uint size) {
+  if (size <= 1u) {
+    return 0u;
+  }
+  const int period = int(size) * 2 - 2;
+  int mirrored = index % period;
+  if (mirrored < 0) {
+    mirrored += period;
+  }
+  if (mirrored >= int(size)) {
+    mirrored = period - mirrored;
+  }
+  return uint(mirrored);
+}
+
+vec3 hanatosRaw(vec3 xyz) {
+  if (params.hanatosWidth < 2u || params.hanatosHeight < 2u) {
+    return vec3(0.0);
+  }
+
+  const float b = xyz.x + xyz.y + xyz.z;
+  const vec2 xy = clamp(xyz.xy / max(b, 1.0e-10), vec2(0.0), vec2(1.0));
+  const float tx = clamp((1.0 - xy.x) * (1.0 - xy.x), 0.0, 1.0);
+  const float ty = clamp(xy.y / max(1.0 - xy.x, 1.0e-10), 0.0, 1.0);
+  const float xCoord = tx * float(params.hanatosWidth - 1u);
+  const float yCoord = ty * float(params.hanatosHeight - 1u);
+  const int xBase = xCoord >= float(params.hanatosWidth - 1u) ? int(params.hanatosWidth - 2u) : int(floor(xCoord));
+  const int yBase = yCoord >= float(params.hanatosHeight - 1u) ? int(params.hanatosHeight - 2u) : int(floor(yCoord));
+  const float xFrac = xCoord >= float(params.hanatosWidth - 1u) ? 1.0 : xCoord - float(xBase);
+  const float yFrac = yCoord >= float(params.hanatosHeight - 1u) ? 1.0 : yCoord - float(yBase);
+  float wx[4] = float[4](
+    mitchellWeight(xFrac + 1.0),
+    mitchellWeight(xFrac),
+    mitchellWeight(xFrac - 1.0),
+    mitchellWeight(xFrac - 2.0)
+  );
+  float wy[4] = float[4](
+    mitchellWeight(yFrac + 1.0),
+    mitchellWeight(yFrac),
+    mitchellWeight(yFrac - 1.0),
+    mitchellWeight(yFrac - 2.0)
+  );
+
+  vec3 raw = vec3(0.0);
+  float weightSum = 0.0;
+  const uint responseOffset = colorAdaptationEnabled(kColorAdaptationInputCompression)
+    ? params.hanatosWidth * params.hanatosHeight
+    : 0u;
+  for (uint i = 0u; i < 4u; ++i) {
+    const uint xi = safeIndex(xBase - 1 + int(i), params.hanatosWidth);
+    for (uint j = 0u; j < 4u; ++j) {
+      const uint yj = safeIndex(yBase - 1 + int(j), params.hanatosHeight);
+      const float weight = wx[i] * wy[j];
+      weightSum += weight;
+      const uint lutOffset = responseOffset + xi * params.hanatosHeight + yj;
+      raw += weight * hanatosRawResponse[lutOffset].xyz;
+    }
+  }
+  if (weightSum != 0.0) {
+    raw /= weightSum;
+  }
+  return raw * max(b, 0.0);
+}
+
+void main() {
+  const uvec2 activeGid = gl_GlobalInvocationID.xy;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {
+    return;
+  }
+
+  const uvec2 gid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (gid.x >= params.width || gid.y >= params.height) {
+    return;
+  }
+  const uint index = gid.y * params.width + gid.x;
+  const uvec2 absoluteGid = gid + uvec2(params.tileOriginX, params.tileOriginY);
+  const uint fullWidth = max(params.fullWidth, max(params.width, 1u));
+  const uint fullHeight = max(params.fullHeight, max(params.height, 1u));
+  const uint sourceIndex = params._pad2 == 1u
+    ? min(absoluteGid.y, fullHeight - 1u) * fullWidth + min(absoluteGid.x, fullWidth - 1u)
+    : index;
+  const float exposure = exp2(
+    params.filmExposureEv +
+    ((params._pad1 & kAutoExposureEnabled) != 0u ? autoExposureEv[0] : 0.0)
+  );
+  const uint colorSpace = colorSpaceIndex();
+  const vec4 source = loadSourcePixel(sourceIndex);
+  const vec3 decoded = decodeInputRgb(source.rgb, colorSpace);
+  const vec3 linearSrgb = multiplyInputToSrgb(decoded, colorSpace);
+  const vec3 referenceXyz = multiplyInputToReferenceXyz(decoded, colorSpace);
+  const vec3 raw = params.rgbToRawMethod == 1 ? mallettRaw(linearSrgb) : hanatosRaw(referenceXyz);
+  const vec3 rgb = max(raw * exposure, vec3(0.0));
+  storeFilmRawPixel(
+    index,
+    (params._pad0 & 1u) != 0u
+      ? vec4(rgb, source.a)
+      : vec4(log(rgb + vec3(1.0e-10)) * kLog10E, source.a)
+  );
+}

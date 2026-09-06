@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "raw_color.glsl"
+#include "frame_geometry.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D captureOutput;
+layout(set = 0, binding = 7) uniform sampler2D rcdInput;
+
+void main()
+{
+    ivec2 outputPosition = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(outputPosition, frameGeometry.transform.zw)))
+        return;
+
+    ivec2 rawDimensions = textureSize(rcdInput, 0);
+    vec2 sourceUv = geometrySourceUv(outputPosition);
+    ivec2 rawPosition = geometrySourcePosition(outputPosition, rawDimensions);
+    vec3 rawRgb = texelFetch(rcdInput, rawPosition, 0).rgb;
+    vec3 processed = rawColorProcess(
+        rawRgb, geometryLensShadingUv(sourceUv), 0.0);
+    imageStore(captureOutput, outputPosition, vec4(processed, 1.0));
+}

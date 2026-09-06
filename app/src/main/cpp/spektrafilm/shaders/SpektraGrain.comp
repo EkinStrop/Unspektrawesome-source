@@ -1,0 +1,1183 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+const uint kOpPreview = 0u;
+const uint kOpProductionLayers = 1u;
+const uint kOpLayerBlurX = 2u;
+const uint kOpLayerBlurY = 3u;
+const uint kOpMicroSource = 4u;
+const uint kOpMicroBlurX = 5u;
+const uint kOpMicroBlurY = 6u;
+const uint kOpResolveDensity = 7u;
+const uint kOpDensityBlurX = 8u;
+const uint kOpDensityBlurY = 9u;
+const uint kOpApplyControls = 10u;
+const uint kOpSynthesisLayers = 11u;
+const uint kOpSynthesisResolveDensity = 12u;
+const uint kOpCopyDensity = 13u;
+
+const uint kFrameFilmDensityMaxR = 16u;
+const uint kFrameFilmDensityMaxG = 17u;
+const uint kFrameFilmDensityMaxB = 18u;
+const uint kFrameGrainAmount = 49u;
+const uint kFrameGrainSaturation = 50u;
+const uint kFrameGrainParticleAreaUm2 = 51u;
+const uint kFrameGrainParticleScaleR = 52u;
+const uint kFrameGrainParticleScaleG = 53u;
+const uint kFrameGrainParticleScaleB = 54u;
+const uint kFrameGrainParticleScaleLayer0 = 55u;
+const uint kFrameGrainParticleScaleLayer1 = 56u;
+const uint kFrameGrainParticleScaleLayer2 = 57u;
+const uint kFrameGrainDensityMinR = 58u;
+const uint kFrameGrainDensityMinG = 59u;
+const uint kFrameGrainDensityMinB = 60u;
+const uint kFrameGrainUniformityR = 61u;
+const uint kFrameGrainUniformityG = 62u;
+const uint kFrameGrainUniformityB = 63u;
+const uint kFrameGrainFinalBlurSigmaPx = 64u;
+const uint kFrameGrainBlurDyeCloudsUm = 65u;
+const uint kFrameGrainMicroStructureScale = 66u;
+const uint kFrameGrainMicroStructureSigmaPx = 67u;
+const uint kFrameEnlargerScale = 68u;
+const uint kFrameEnlargerOffsetXPercent = 69u;
+const uint kFrameEnlargerOffsetYPercent = 70u;
+const uint kFrameFilmPixelSizeUm = 71u;
+const uint kFrameGrainSynthesisAmount = 78u;
+const uint kFrameGrainSynthesisMeanRadiusUm = 79u;
+const uint kFrameGrainSynthesisRadiusStdDevRatio = 80u;
+const uint kFrameGrainSynthesisObservationSigmaUm = 81u;
+const uint kFrameGrainSynthesisCellSizeRatio = 82u;
+const uint kFrameGrainSynthesisMaxRadiusQuantile = 83u;
+const uint kFrameGrainSynthesisCoverageEpsilon = 84u;
+const uint kFrameGrainSynthesisRadiusScaleR = 85u;
+const uint kFrameGrainSynthesisRadiusScaleG = 86u;
+const uint kFrameGrainSynthesisRadiusScaleB = 87u;
+const uint kFrameGrainSynthesisLayerScale0 = 88u;
+const uint kFrameGrainSynthesisLayerScale1 = 89u;
+const uint kFrameGrainSynthesisLayerScale2 = 90u;
+
+const uint kFrameIntFilmPositive = 10u;
+const uint kFrameIntGrainSeed = 16u;
+const uint kFrameIntGrainSublayersEnabled = 17u;
+const uint kFrameIntGrainSubLayerCount = 18u;
+const uint kFrameIntGrainFrameSeed = 19u;
+const uint kFrameIntGrainSynthesisSamples = 22u;
+const uint kFrameIntGrainSynthesisMaxGrainsPerCell = 23u;
+const uint kFrameIntGrainSynthesisLayered = 24u;
+const uint kFrameIntGrainSynthesisActive = 25u;
+const uint kFrameIntGrainBlurRecurrence = 26u;
+
+layout(std430, binding = 0) readonly buffer SourcePixels {
+  vec4 sourcePixels[];
+};
+
+layout(std430, binding = 1) buffer DestinationPixels {
+  vec4 destinationPixels[];
+};
+
+layout(std430, binding = 2) buffer AuxPixelsA {
+  vec4 auxPixelsA[];
+};
+
+layout(std430, binding = 3) buffer AuxPixelsB {
+  vec4 auxPixelsB[];
+};
+
+layout(std430, binding = 4) buffer MicroPixelsA {
+  vec4 microPixelsA[];
+};
+
+layout(std430, binding = 5) buffer MicroPixelsB {
+  vec4 microPixelsB[];
+};
+
+layout(std430, binding = 6) buffer GrainLayerA {
+  float grainLayerA[];
+};
+
+layout(std430, binding = 7) buffer GrainLayerB {
+  float grainLayerB[];
+};
+
+layout(std430, binding = 8) readonly buffer FilmDensityCurves {
+  float densityCurves[];
+};
+
+layout(std430, binding = 9) readonly buffer FilmDensityCurveLayers {
+  float densityCurveLayers[];
+};
+
+layout(std430, binding = 10) readonly buffer FilmDensityCurveLayerMaxima {
+  float densityCurveLayerMaxima[];
+};
+
+layout(std430, binding = 27) readonly buffer FrameFloats {
+  float frameFloats[];
+};
+
+layout(std430, binding = 28) readonly buffer FrameInts {
+  uint frameInts[];
+};
+
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint operation;
+  uint _pad1;
+  uint _pad2;
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+
+vec4 loadSourcePixel(uint index) { return sourcePixels[index]; }
+vec4 loadDestinationPixel(uint index) { return destinationPixels[index]; }
+vec4 loadMicroAPixel(uint index) { return microPixelsA[index]; }
+vec4 loadMicroBPixel(uint index) { return microPixelsB[index]; }
+void storeDestinationPixel(uint index, vec4 value) { destinationPixels[index] = value; }
+void storeAuxAPixel(uint index, vec4 value) { auxPixelsA[index] = value; }
+void storeMicroAPixel(uint index, vec4 value) { microPixelsA[index] = value; }
+void storeMicroBPixel(uint index, vec4 value) { microPixelsB[index] = value; }
+
+float f(uint index) {
+  return frameFloats[index];
+}
+
+uint u(uint index) {
+  return frameInts[index];
+}
+
+uint spektraHash(uint x) {
+  x ^= x >> 16u;
+  x *= 0x7feb352du;
+  x ^= x >> 15u;
+  x *= 0x846ca68bu;
+  x ^= x >> 16u;
+  return x;
+}
+
+float rand01(uint seed) {
+  return (float(spektraHash(seed) & 0x00ffffffu) + 0.5) / 16777216.0;
+}
+
+float gaussian(uint seed) {
+  const float u1 = max(rand01(seed), 1.0e-6);
+  const float u2 = rand01(seed ^ 0x9e3779b9u);
+  return sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
+}
+
+uint filmCellSeed(vec2 filmUm, float cellSizeUm, uint seed) {
+  const float safeCellSize = max(cellSizeUm, 1.0e-4);
+  const ivec2 cell = ivec2(floor(filmUm / safeCellSize));
+  return spektraHash(seed ^ (uint(cell.x) * 0x1f123bb5u) ^ (uint(cell.y) * 0x5f356495u));
+}
+
+uvec2 absolutePixel(uvec2 gid) {
+  return gid + uvec2(params.tileOriginX, params.tileOriginY);
+}
+
+vec2 fullFrameDims() {
+  return vec2(max(params.fullWidth, max(params.width, 1u)), max(params.fullHeight, max(params.height, 1u)));
+}
+
+vec2 outputPixelFilmUm(uvec2 gid) {
+  const float scale = max(f(kFrameEnlargerScale), 1.0);
+  const vec2 safeDims = fullFrameDims();
+  const vec2 outputUv = (vec2(absolutePixel(gid)) + vec2(0.5)) / safeDims;
+  const vec2 sourceUv = vec2(0.5) +
+    (outputUv - vec2(0.5)) / scale +
+    vec2(f(kFrameEnlargerOffsetXPercent), f(kFrameEnlargerOffsetYPercent)) * (0.01 / scale);
+  const float framePixelSizeUm = max(f(kFrameFilmPixelSizeUm) * scale, 1.0e-6);
+  return sourceUv * safeDims * framePixelSizeUm;
+}
+
+ivec2 filmUmToOutputPixel(vec2 filmUm) {
+  const float scale = max(f(kFrameEnlargerScale), 1.0);
+  const vec2 safeDims = fullFrameDims();
+  const float framePixelSizeUm = max(f(kFrameFilmPixelSizeUm) * scale, 1.0e-6);
+  const vec2 sourceUv = filmUm / (safeDims * framePixelSizeUm);
+  const vec2 outputUv = vec2(0.5) +
+    (sourceUv - vec2(0.5)) * scale -
+    vec2(f(kFrameEnlargerOffsetXPercent), f(kFrameEnlargerOffsetYPercent)) * 0.01;
+  return ivec2(floor(outputUv * safeDims)) - ivec2(params.tileOriginX, params.tileOriginY);
+}
+
+uint clampX(int x) {
+  return uint(clamp(x, 0, int(max(params.width, 1u)) - 1));
+}
+
+uint clampY(int y) {
+  return uint(clamp(y, 0, int(max(params.height, 1u)) - 1));
+}
+
+vec4 sampleSource(int x, int y) {
+  const uint sx = clampX(x);
+  const uint sy = clampY(y);
+  return loadSourcePixel(sy * params.width + sx);
+}
+
+vec4 sampleDestination(int x, int y) {
+  const uint sx = clampX(x);
+  const uint sy = clampY(y);
+  return loadDestinationPixel(sy * params.width + sx);
+}
+
+float sampleLayerA(int x, int y, uint component) {
+  const uint sx = clampX(x);
+  const uint sy = clampY(y);
+  return grainLayerA[(sy * params.width + sx) * 9u + component];
+}
+
+float sampleLayerB(int x, int y, uint component) {
+  const uint sx = clampX(x);
+  const uint sy = clampY(y);
+  return grainLayerB[(sy * params.width + sx) * 9u + component];
+}
+
+vec4 sampleMicroA(int x, int y) {
+  const uint sx = clampX(x);
+  const uint sy = clampY(y);
+  return loadMicroAPixel(sy * params.width + sx);
+}
+
+vec4 sampleMicroB(int x, int y) {
+  const uint sx = clampX(x);
+  const uint sy = clampY(y);
+  return loadMicroBPixel(sy * params.width + sx);
+}
+
+float gaussianWeight(float offset, float sigma) {
+  return exp(-0.5 * (offset * offset) / max(sigma * sigma, 1.0e-8));
+}
+
+struct GaussianBlurInfo {
+  float firstWeight;
+  float firstRatio;
+  float ratioStep;
+  float invWeightSum;
+  uint radius;
+  uint enabled;
+};
+
+GaussianBlurInfo makeGaussianBlurInfo(float sigma, int radiusLimit) {
+  GaussianBlurInfo info;
+  info.firstWeight = 0.0;
+  info.firstRatio = 0.0;
+  info.ratioStep = 0.0;
+  info.invWeightSum = 1.0;
+  info.radius = 0u;
+  info.enabled = sigma > 1.0e-4 ? 1u : 0u;
+  if (info.enabled == 0u) {
+    return info;
+  }
+  info.radius = uint(max(min(int(ceil(3.0 * sigma)), radiusLimit), 0));
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  info.firstWeight = exp(-0.5 * invSigma2);
+  info.firstRatio = exp(-1.5 * invSigma2);
+  info.ratioStep = exp(-invSigma2);
+  float weight = info.firstWeight;
+  float ratio = info.firstRatio;
+  float weightSum = 1.0;
+  for (uint offset = 1u; offset <= info.radius; ++offset) {
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  info.invWeightSum = 1.0 / max(weightSum, 1.0e-8);
+  return info;
+}
+
+float channelComponent(vec3 value, uint channel) {
+  return value[int(channel)];
+}
+
+float channelDensityMin(uint channel) {
+  if (channel == 0u) {
+    return max(f(kFrameGrainDensityMinR), 0.0);
+  }
+  if (channel == 1u) {
+    return max(f(kFrameGrainDensityMinG), 0.0);
+  }
+  return max(f(kFrameGrainDensityMinB), 0.0);
+}
+
+float channelParticleScale(uint channel) {
+  if (channel == 0u) {
+    return max(f(kFrameGrainParticleScaleR), 1.0e-3);
+  }
+  if (channel == 1u) {
+    return max(f(kFrameGrainParticleScaleG), 1.0e-3);
+  }
+  return max(f(kFrameGrainParticleScaleB), 1.0e-3);
+}
+
+float channelUniformity(uint channel) {
+  if (channel == 0u) {
+    return clamp(f(kFrameGrainUniformityR), 0.0, 1.0);
+  }
+  if (channel == 1u) {
+    return clamp(f(kFrameGrainUniformityG), 0.0, 1.0);
+  }
+  return clamp(f(kFrameGrainUniformityB), 0.0, 1.0);
+}
+
+float channelDensityMax(uint channel) {
+  if (channel == 0u) {
+    return max(f(kFrameFilmDensityMaxR), 1.0e-6);
+  }
+  if (channel == 1u) {
+    return max(f(kFrameFilmDensityMaxG), 1.0e-6);
+  }
+  return max(f(kFrameFilmDensityMaxB), 1.0e-6);
+}
+
+float layerParticleScale(uint layer) {
+  if (layer == 0u) {
+    return max(f(kFrameGrainParticleScaleLayer0), 1.0e-3);
+  }
+  if (layer == 1u) {
+    return max(f(kFrameGrainParticleScaleLayer1), 1.0e-3);
+  }
+  return max(f(kFrameGrainParticleScaleLayer2), 1.0e-3);
+}
+
+vec3 applyGrainControls(vec3 baseDensity, vec3 grainedDensity) {
+  const float amount = max(f(kFrameGrainAmount), 0.0);
+  const float saturation = clamp(f(kFrameGrainSaturation), 0.0, 1.0);
+  vec3 delta = (grainedDensity - baseDensity) * amount;
+  const float neutral = (delta.r + delta.g + delta.b) / 3.0;
+  delta = mix(vec3(neutral), delta, saturation);
+  return max(baseDensity + delta, vec3(0.0));
+}
+
+float particleDevelopedDensity(
+  float density,
+  float densityMax,
+  float particles,
+  float uniformity,
+  float blurDamping,
+  uint seed
+) {
+  const float safeDensityMax = max(densityMax, 1.0e-6);
+  const float safeParticles = max(particles, 1.0e-3);
+  const float probability = clamp(density / safeDensityMax, 1.0e-6, 1.0 - 1.0e-6);
+  const float saturation = max(1.0 - probability * uniformity * (1.0 - 1.0e-6), 1.0e-6);
+  const float expectedSeeds = safeParticles / saturation;
+  const float expectedDeveloped = expectedSeeds * probability;
+  const float variance = max(expectedSeeds * probability, 1.0e-6);
+  const float developed = clamp(expectedDeveloped + sqrt(variance) * gaussian(seed) * blurDamping, 0.0, expectedSeeds);
+  return developed * (safeDensityMax / safeParticles) * saturation;
+}
+
+vec3 previewGrainDensity(vec3 densityCmy, vec2 filmUm, uint baseSeed) {
+  vec3 outDensity = densityCmy;
+  const float pixelArea = max(f(kFrameFilmPixelSizeUm) * f(kFrameFilmPixelSizeUm), 1.0e-6);
+  const float finalBlurPx = max(f(kFrameGrainFinalBlurSigmaPx), 0.0);
+  const float blurDamping = inversesqrt(1.0 + 0.35 * finalBlurPx + 0.12 * max(f(kFrameGrainBlurDyeCloudsUm), 0.0));
+  const uint layerCount = u(kFrameIntGrainSublayersEnabled) != 0u
+    ? 3u
+    : uint(clamp(int(u(kFrameIntGrainSubLayerCount)), 1, 8));
+
+  for (uint channel = 0u; channel < 3u; ++channel) {
+    const float densityMin = channelDensityMin(channel);
+    const float densityMax = channelDensityMax(channel) + densityMin;
+    const float particleArea = max(f(kFrameGrainParticleAreaUm2) * channelParticleScale(channel), 1.0e-4);
+    const float particles = max(pixelArea / particleArea / max(float(layerCount), 1.0), 1.0e-3);
+    const float sourceDensity = max(channelComponent(densityCmy, channel) + densityMin, 0.0);
+    float accumulated = 0.0;
+    for (uint layer = 0u; layer < layerCount; ++layer) {
+      const uint particleSeed = filmCellSeed(
+        filmUm,
+        sqrt(particleArea),
+        baseSeed ^ (channel * 0x85ebca6bu) ^ (layer * 0xc2b2ae35u)
+      );
+      accumulated += particleDevelopedDensity(
+        sourceDensity,
+        densityMax,
+        particles,
+        channelUniformity(channel),
+        blurDamping,
+        particleSeed
+      );
+    }
+    accumulated /= max(float(layerCount), 1.0);
+    outDensity[int(channel)] = max(accumulated - densityMin, 0.0);
+  }
+  return outDensity;
+}
+
+float interpDensityLayer(float density, uint channel, uint layer) {
+  const uint count = params.exposureCount;
+  if (count == 0u) {
+    return 0.0;
+  }
+  const bool positive = u(kFrameIntFilmPositive) != 0u;
+  const float target = positive ? -density : density;
+  const float firstX = positive ? -densityCurves[channel] : densityCurves[channel];
+  const float lastX = positive
+    ? -densityCurves[(count - 1u) * 3u + channel]
+    : densityCurves[(count - 1u) * 3u + channel];
+  const bool ascending = lastX >= firstX;
+  if ((ascending && target <= firstX) || (!ascending && target >= firstX)) {
+    return densityCurveLayers[layer * 3u + channel];
+  }
+  if ((ascending && target >= lastX) || (!ascending && target <= lastX)) {
+    return densityCurveLayers[(count - 1u) * 9u + layer * 3u + channel];
+  }
+
+  uint lo = 0u;
+  uint hi = count - 1u;
+  while (hi - lo > 1u) {
+    const uint mid = (lo + hi) >> 1u;
+    const float x = positive ? -densityCurves[mid * 3u + channel] : densityCurves[mid * 3u + channel];
+    if ((ascending && x <= target) || (!ascending && x >= target)) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+
+  const float x0 = positive ? -densityCurves[lo * 3u + channel] : densityCurves[lo * 3u + channel];
+  const float x1 = positive ? -densityCurves[hi * 3u + channel] : densityCurves[hi * 3u + channel];
+  const float y0 = densityCurveLayers[lo * 9u + layer * 3u + channel];
+  const float y1 = densityCurveLayers[hi * 9u + layer * 3u + channel];
+  const float t = clamp((target - x0) / max(x1 - x0, 1.0e-9), 0.0, 1.0);
+  return max(mix(y0, y1, t), 0.0);
+}
+
+float layerDensityMaxTotal(uint channel) {
+  float total = 0.0;
+  for (uint layer = 0u; layer < 3u; ++layer) {
+    total += max(densityCurveLayerMaxima[layer * 3u + channel], 0.0);
+  }
+  return max(total, 1.0e-6);
+}
+
+float normalQuantile(float p) {
+  p = clamp(p, 1.0e-6, 1.0 - 1.0e-6);
+  const float a1 = -3.969683028665376e+01;
+  const float a2 = 2.209460984245205e+02;
+  const float a3 = -2.759285104469687e+02;
+  const float a4 = 1.383577518672690e+02;
+  const float a5 = -3.066479806614716e+01;
+  const float a6 = 2.506628277459239e+00;
+  const float b1 = -5.447609879822406e+01;
+  const float b2 = 1.615858368580409e+02;
+  const float b3 = -1.556989798598866e+02;
+  const float b4 = 6.680131188771972e+01;
+  const float b5 = -1.328068155288572e+01;
+  const float c1 = -7.784894002430293e-03;
+  const float c2 = -3.223964580411365e-01;
+  const float c3 = -2.400758277161838e+00;
+  const float c4 = -2.549732539343734e+00;
+  const float c5 = 4.374664141464968e+00;
+  const float c6 = 2.938163982698783e+00;
+  const float d1 = 7.784695709041462e-03;
+  const float d2 = 3.224671290700398e-01;
+  const float d3 = 2.445134137142996e+00;
+  const float d4 = 3.754408661907416e+00;
+  const float plow = 0.02425;
+  const float phigh = 1.0 - plow;
+  if (p < plow) {
+    const float q = sqrt(-2.0 * log(p));
+    return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+      ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+  }
+  if (p > phigh) {
+    const float q = sqrt(-2.0 * log(1.0 - p));
+    return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+      ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+  }
+  const float q = p - 0.5;
+  const float r = q * q;
+  return (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
+    (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0);
+}
+
+float grainSynthesisChannelScale(uint channel) {
+  if (channel == 0u) {
+    return max(f(kFrameGrainSynthesisRadiusScaleR), 1.0e-6);
+  }
+  if (channel == 1u) {
+    return max(f(kFrameGrainSynthesisRadiusScaleG), 1.0e-6);
+  }
+  return max(f(kFrameGrainSynthesisRadiusScaleB), 1.0e-6);
+}
+
+float grainSynthesisLayerScale(uint layer) {
+  if (u(kFrameIntGrainSynthesisLayered) == 0u) {
+    return 1.0;
+  }
+  if (layer == 0u) {
+    return max(f(kFrameGrainSynthesisLayerScale0), 1.0e-6);
+  }
+  if (layer == 1u) {
+    return max(f(kFrameGrainSynthesisLayerScale1), 1.0e-6);
+  }
+  return max(f(kFrameGrainSynthesisLayerScale2), 1.0e-6);
+}
+
+struct GrainSynthesisEval {
+  float scaledMeanRadius;
+  float maxRadius;
+  float maxRadiusSquared;
+  float cellSize;
+  float meanArea;
+  float cellArea;
+  float densityToLambda;
+  uint grainCap;
+};
+
+uint mixSeed(uint seed, uint value) {
+  return spektraHash(seed ^ (value + 0x9e3779b9u + (seed << 6u) + (seed >> 2u)));
+}
+
+uint grainSynthesisCellSeed(ivec2 cell, uint channel, uint layer) {
+  uint seed = mixSeed(u(kFrameIntGrainSeed), uint(cell.x));
+  seed = mixSeed(seed, uint(cell.y));
+  seed = mixSeed(seed, channel * 0x85ebca6bu);
+  seed = mixSeed(seed, layer * 0xc2b2ae35u);
+  return mixSeed(seed, u(kFrameIntGrainFrameSeed));
+}
+
+uint poissonSample(float lambda, uint seed, uint cap) {
+  if (lambda <= 0.0 || cap == 0u) {
+    return 0u;
+  }
+  if (lambda < 1.0e-5) {
+    return rand01(seed ^ 0x4cf5ad43u) < lambda ? 1u : 0u;
+  }
+  if (lambda < 8.0) {
+    const float threshold = exp(-lambda);
+    float product = 1.0;
+    uint k = 0u;
+    while (k < cap) {
+      product *= rand01(seed ^ (k * 0x27d4eb2du));
+      if (product <= threshold) {
+        break;
+      }
+      ++k;
+    }
+    return min(k, cap);
+  }
+  const float poissonEstimate = floor(lambda + sqrt(lambda) * gaussian(seed ^ 0x165667b1u) + 0.5);
+  return uint(clamp(poissonEstimate, 0.0, float(cap)));
+}
+
+float grainSynthesisRadius(float meanRadius, float maxRadius, uint seed) {
+  const float ratio = max(f(kFrameGrainSynthesisRadiusStdDevRatio), 0.0);
+  if (ratio <= 1.0e-6) {
+    return meanRadius;
+  }
+  const float logSigma = sqrt(log(1.0 + ratio * ratio));
+  const float logMean = log(max(meanRadius, 1.0e-6)) - 0.5 * logSigma * logSigma;
+  return min(exp(logMean + logSigma * gaussian(seed)), maxRadius);
+}
+
+float grainSynthesisMaxRadius(float meanRadius) {
+  const float ratio = max(f(kFrameGrainSynthesisRadiusStdDevRatio), 0.0);
+  if (ratio <= 1.0e-6) {
+    return meanRadius;
+  }
+  const float logSigma = sqrt(log(1.0 + ratio * ratio));
+  const float logMean = log(max(meanRadius, 1.0e-6)) - 0.5 * logSigma * logSigma;
+  return exp(logMean + logSigma * normalQuantile(f(kFrameGrainSynthesisMaxRadiusQuantile)));
+}
+
+GrainSynthesisEval makeGrainSynthesisEval(uint layer, uint channel, bool fixedRadius) {
+  GrainSynthesisEval eval;
+  eval.scaledMeanRadius = max(
+    f(kFrameGrainSynthesisMeanRadiusUm) *
+      grainSynthesisChannelScale(channel) *
+      grainSynthesisLayerScale(layer),
+    1.0e-6
+  );
+  const float ratio = fixedRadius ? 0.0 : max(f(kFrameGrainSynthesisRadiusStdDevRatio), 0.0);
+  eval.maxRadius = fixedRadius
+    ? eval.scaledMeanRadius
+    : max(grainSynthesisMaxRadius(eval.scaledMeanRadius), eval.scaledMeanRadius);
+  eval.maxRadiusSquared = eval.maxRadius * eval.maxRadius;
+  eval.cellSize = max(f(kFrameGrainSynthesisMeanRadiusUm) * max(f(kFrameGrainSynthesisCellSizeRatio), 0.05), 1.0e-4);
+  eval.meanArea = 3.14159265359 * eval.scaledMeanRadius * eval.scaledMeanRadius * (1.0 + ratio * ratio);
+  eval.cellArea = eval.cellSize * eval.cellSize;
+  eval.densityToLambda = 2.302585093 / max(eval.meanArea, 1.0e-12);
+  eval.grainCap = clamp(u(kFrameIntGrainSynthesisMaxGrainsPerCell), 1u, 128u);
+  return eval;
+}
+
+float grainSynthesisCellDistanceSquared(vec2 pointUm, vec2 cellOrigin, float cellSize) {
+  const vec2 cellMax = cellOrigin + cellSize;
+  const vec2 closest = clamp(pointUm, cellOrigin, cellMax);
+  const vec2 delta = pointUm - closest;
+  return dot(delta, delta);
+}
+
+uint grainSynthesisAdaptiveSampleCount(float targetDensity, uint requestedSamples) {
+  if (requestedSamples <= 4u) {
+    return requestedSamples;
+  }
+  const float coverage = clamp(1.0 - exp(-max(targetDensity, 0.0) * 2.302585093), 0.0, 1.0);
+  const float varianceWeight = sqrt(clamp((coverage * (1.0 - coverage)) * 4.0, 0.0, 1.0));
+  const float sampleScale = mix(0.25, 1.0, varianceWeight);
+  const uint minimumSamples = min(requestedSamples, max(4u, requestedSamples / 16u));
+  const uint adaptiveSamples = uint(ceil(float(requestedSamples) * sampleScale));
+  return min(max(adaptiveSamples, minimumSamples), requestedSamples);
+}
+
+float grainSynthesisDensityAtUm(vec2 filmUm, uint layer, uint channel) {
+  const ivec2 pixel = filmUmToOutputPixel(filmUm);
+  const vec3 density = sampleSource(pixel.x, pixel.y).rgb;
+  if (u(kFrameIntGrainSynthesisLayered) == 0u) {
+    return layer == 0u ? max(channelComponent(density, channel), 0.0) : 0.0;
+  }
+  return interpDensityLayer(channelComponent(density, channel), channel, layer);
+}
+
+bool grainSynthesisIndicator(vec2 pointUm, uint layer, uint channel, GrainSynthesisEval eval, bool fixedRadius) {
+  const vec2 minCellFloat = floor((pointUm - eval.maxRadius) / eval.cellSize);
+  const vec2 maxCellFloat = floor((pointUm + eval.maxRadius) / eval.cellSize);
+  const ivec2 cellMin = ivec2(int(minCellFloat.x), int(minCellFloat.y));
+  const ivec2 cellMax = ivec2(int(maxCellFloat.x), int(maxCellFloat.y));
+
+  for (int cy = cellMin.y; cy <= cellMax.y; ++cy) {
+    for (int cx = cellMin.x; cx <= cellMax.x; ++cx) {
+      const ivec2 cell = ivec2(cx, cy);
+      const vec2 cellOrigin = vec2(float(cell.x), float(cell.y)) * eval.cellSize;
+      if (grainSynthesisCellDistanceSquared(pointUm, cellOrigin, eval.cellSize) > eval.maxRadiusSquared) {
+        continue;
+      }
+      const vec2 cellCenter = cellOrigin + vec2(0.5 * eval.cellSize);
+      const float targetDensity = grainSynthesisDensityAtUm(cellCenter, layer, channel);
+      if (targetDensity <= 0.0) {
+        continue;
+      }
+      const float expectedGrains = max(targetDensity, 0.0) * eval.densityToLambda * eval.cellArea;
+      if (expectedGrains <= 1.0e-7) {
+        continue;
+      }
+      const uint baseSeed = grainSynthesisCellSeed(cell, channel, layer);
+      const uint grainCount = poissonSample(expectedGrains, baseSeed, eval.grainCap);
+      for (uint grain = 0u; grain < grainCount; ++grain) {
+        const uint grainSeed = mixSeed(baseSeed, grain * 0x9e3779b9u);
+        const vec2 center = cellOrigin + vec2(
+          rand01(grainSeed ^ 0x68bc21ebu),
+          rand01(grainSeed ^ 0x02e5be93u)
+        ) * eval.cellSize;
+        const float radius = fixedRadius
+          ? eval.scaledMeanRadius
+          : grainSynthesisRadius(eval.scaledMeanRadius, eval.maxRadius, grainSeed ^ 0x85ebca6bu);
+        const vec2 delta = pointUm - center;
+        if (dot(delta, delta) <= radius * radius) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+float grainSynthesisLayerFromDensity(uvec3 gid, uint baseSeed) {
+  const uint component = gid.z;
+  const uint layer = component / 3u;
+  const uint channel = component - layer * 3u;
+  if (u(kFrameIntGrainSynthesisLayered) == 0u && layer > 0u) {
+    return 0.0;
+  }
+
+  const uint requestedSamples = clamp(u(kFrameIntGrainSynthesisSamples), 1u, 1024u);
+  const float sigmaUm = max(f(kFrameGrainSynthesisObservationSigmaUm), 0.0);
+  const vec2 centerUm = outputPixelFilmUm(gid.xy);
+  const float targetCenterDensity = grainSynthesisDensityAtUm(centerUm, layer, channel);
+  if (targetCenterDensity <= 1.0e-7 && sigmaUm <= 1.0e-6) {
+    return 0.0;
+  }
+
+  const bool fixedRadius = f(kFrameGrainSynthesisRadiusStdDevRatio) <= 1.0e-6;
+  const uint sampleCount = grainSynthesisAdaptiveSampleCount(targetCenterDensity, requestedSamples);
+  GrainSynthesisEval eval = makeGrainSynthesisEval(layer, channel, fixedRadius);
+  const uint sampleSeedBase = spektraHash(baseSeed ^ (channel * 0x85ebca6bu) ^ (layer * 0xc2b2ae35u));
+
+  float covered = 0.0;
+  for (uint sampleIndex = 0u; sampleIndex < sampleCount; ++sampleIndex) {
+    const uint sampleSeed = mixSeed(sampleSeedBase, sampleIndex);
+    const vec2 sampleOffset = sigmaUm > 0.0
+      ? vec2(
+          gaussian(sampleSeed ^ 0x23d3c1f1u),
+          gaussian(sampleSeed ^ 0xa349b329u)
+        ) * sigmaUm
+      : vec2(0.0);
+    covered += grainSynthesisIndicator(centerUm + sampleOffset, layer, channel, eval, fixedRadius) ? 1.0 : 0.0;
+  }
+
+  const float epsilon = max(f(kFrameGrainSynthesisCoverageEpsilon), 1.0e-8);
+  const float coverage = clamp(covered / max(float(sampleCount), 1.0), 0.0, 1.0 - epsilon);
+  return -log(max(1.0 - coverage, epsilon)) / 2.302585093;
+}
+
+vec3 resolveGrainSynthesisDensity(uint index) {
+  vec3 density = vec3(0.0);
+  if (u(kFrameIntGrainSynthesisLayered) == 0u) {
+    density = vec3(
+      max(grainLayerA[index * 9u], 0.0),
+      max(grainLayerA[index * 9u + 1u], 0.0),
+      max(grainLayerA[index * 9u + 2u], 0.0)
+    );
+  } else {
+    for (uint layer = 0u; layer < 3u; ++layer) {
+      density.r += max(grainLayerA[index * 9u + layer * 3u], 0.0);
+      density.g += max(grainLayerA[index * 9u + layer * 3u + 1u], 0.0);
+      density.b += max(grainLayerA[index * 9u + layer * 3u + 2u], 0.0);
+    }
+  }
+  density *= max(loadMicroAPixel(index).rgb, vec3(0.0));
+  const vec4 source = loadSourcePixel(index);
+  const float amount = clamp(f(kFrameGrainSynthesisAmount), 0.0, 3.0);
+  return max(source.rgb + (density - source.rgb) * amount, vec3(0.0));
+}
+
+float productionLayerParticleDensity(vec3 filmDensityCmy, uint layer, uint channel, vec2 filmUm, uint baseSeed) {
+  const float pixelArea = max(f(kFrameFilmPixelSizeUm) * f(kFrameFilmPixelSizeUm), 1.0e-6);
+  const float densityMin = channelDensityMin(channel);
+  const float uniformity = channelUniformity(channel);
+
+  if (u(kFrameIntGrainSublayersEnabled) == 0u) {
+    if (layer != 0u) {
+      return 0.0;
+    }
+    const uint subLayerCount = uint(clamp(int(u(kFrameIntGrainSubLayerCount)), 1, 8));
+    const float densityMax = channelDensityMax(channel) + densityMin;
+    const float particleArea = max(f(kFrameGrainParticleAreaUm2) * channelParticleScale(channel), 1.0e-4);
+    const float particles = max(pixelArea / particleArea / max(float(subLayerCount), 1.0), 1.0e-3);
+    const float sourceDensity = max(channelComponent(filmDensityCmy, channel) + densityMin, 0.0);
+    float accumulated = 0.0;
+    for (uint subLayer = 0u; subLayer < subLayerCount; ++subLayer) {
+      const uint particleSeed = filmCellSeed(
+        filmUm,
+        sqrt(particleArea),
+        baseSeed ^ (channel * 0x85ebca6bu) ^ (subLayer * 0x9e3779b9u)
+      );
+      accumulated += particleDevelopedDensity(sourceDensity, densityMax, particles, uniformity, 1.0, particleSeed);
+    }
+    return max(accumulated / max(float(subLayerCount), 1.0) - densityMin, 0.0);
+  }
+
+  const float densityMaxTotal = layerDensityMaxTotal(channel);
+  const float layerMax = max(densityCurveLayerMaxima[layer * 3u + channel], 0.0);
+  const float layerFraction = layerMax / densityMaxTotal;
+  const float layerDensityMin = layerFraction * densityMin;
+  const float layerDensityMax = max(layerMax + layerDensityMin, 1.0e-6);
+  const float layerDensity = interpDensityLayer(channelComponent(filmDensityCmy, channel), channel, layer) + layerDensityMin;
+  const float particleArea = max(
+    f(kFrameGrainParticleAreaUm2) * channelParticleScale(channel) * layerParticleScale(layer),
+    1.0e-4
+  );
+  const float particles = max(pixelArea * layerFraction / particleArea, 1.0e-3);
+  const uint particleSeed = filmCellSeed(
+    filmUm,
+    sqrt(particleArea),
+    baseSeed ^ (channel * 0x85ebca6bu) ^ (layer * 0xc2b2ae35u)
+  );
+  return particleDevelopedDensity(max(layerDensity, 0.0), layerDensityMax, particles, uniformity, 1.0, particleSeed);
+}
+
+float grainLayerBlurSigma(uint layer, uint channel) {
+  if (u(kFrameIntGrainSublayersEnabled) == 0u || f(kFrameGrainBlurDyeCloudsUm) <= 0.0) {
+    return 0.0;
+  }
+  const float densityMin = channelDensityMin(channel);
+  const float densityMaxTotal = layerDensityMaxTotal(channel);
+  const float layerMax = max(densityCurveLayerMaxima[layer * 3u + channel], 0.0);
+  const float layerFraction = layerMax / densityMaxTotal;
+  const float layerDensityMax = max(layerMax + layerFraction * densityMin, 1.0e-6);
+  const float particleArea = max(
+    f(kFrameGrainParticleAreaUm2) * channelParticleScale(channel) * layerParticleScale(layer),
+    1.0e-4
+  );
+  const float pixelArea = max(f(kFrameFilmPixelSizeUm) * f(kFrameFilmPixelSizeUm), 1.0e-6);
+  const float particles = max(pixelArea * layerFraction / particleArea, 1.0e-3);
+  const float odParticle = layerDensityMax / particles;
+  return max(f(kFrameGrainBlurDyeCloudsUm), 0.0) * sqrt(max(odParticle, 0.0));
+}
+
+float layerBlurX(uvec3 gid, bool sourceIsA) {
+  const uint component = gid.z;
+  const uint layer = component / 3u;
+  const uint channel = component - layer * 3u;
+  if (u(kFrameIntGrainSynthesisActive) != 0u && u(kFrameIntGrainSynthesisLayered) == 0u && layer > 0u) {
+    return 0.0;
+  }
+  const float sigma = grainLayerBlurSigma(layer, channel);
+  if (sigma <= 1.0e-4) {
+    return sourceIsA
+      ? sampleLayerA(int(gid.x), int(gid.y), component)
+      : sampleLayerB(int(gid.x), int(gid.y), component);
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = makeGaussianBlurInfo(sigma, 64);
+    if (info.enabled == 0u || info.radius == 0u) {
+      return sourceIsA
+        ? sampleLayerA(int(gid.x), int(gid.y), component)
+        : sampleLayerB(int(gid.x), int(gid.y), component);
+    }
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    const int radius = int(info.radius);
+    float value = sourceIsA ? sampleLayerA(x, y, component) : sampleLayerB(x, y, component);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= radius; ++offset) {
+      const float samplePair = sourceIsA
+        ? sampleLayerA(x - offset, y, component) + sampleLayerA(x + offset, y, component)
+        : sampleLayerB(x - offset, y, component) + sampleLayerB(x + offset, y, component);
+      value += weight * samplePair;
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  float value = 0.0;
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * (sourceIsA
+      ? sampleLayerA(int(gid.x) + offset, int(gid.y), component)
+      : sampleLayerB(int(gid.x) + offset, int(gid.y), component));
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+float layerBlurY(uvec3 gid, bool sourceIsA) {
+  const uint component = gid.z;
+  const uint layer = component / 3u;
+  const uint channel = component - layer * 3u;
+  if (u(kFrameIntGrainSynthesisActive) != 0u && u(kFrameIntGrainSynthesisLayered) == 0u && layer > 0u) {
+    return 0.0;
+  }
+  const float sigma = grainLayerBlurSigma(layer, channel);
+  if (sigma <= 1.0e-4) {
+    return sourceIsA
+      ? sampleLayerA(int(gid.x), int(gid.y), component)
+      : sampleLayerB(int(gid.x), int(gid.y), component);
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = makeGaussianBlurInfo(sigma, 64);
+    if (info.enabled == 0u || info.radius == 0u) {
+      return sourceIsA
+        ? sampleLayerA(int(gid.x), int(gid.y), component)
+        : sampleLayerB(int(gid.x), int(gid.y), component);
+    }
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    const int radius = int(info.radius);
+    float value = sourceIsA ? sampleLayerA(x, y, component) : sampleLayerB(x, y, component);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= radius; ++offset) {
+      const float samplePair = sourceIsA
+        ? sampleLayerA(x, y - offset, component) + sampleLayerA(x, y + offset, component)
+        : sampleLayerB(x, y - offset, component) + sampleLayerB(x, y + offset, component);
+      value += weight * samplePair;
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  float value = 0.0;
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * (sourceIsA
+      ? sampleLayerA(int(gid.x), int(gid.y) + offset, component)
+      : sampleLayerB(int(gid.x), int(gid.y) + offset, component));
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 blurMicroX(uvec2 gid) {
+  const float sigma = max(f(kFrameGrainMicroStructureScale), 0.0) / max(f(kFrameFilmPixelSizeUm), 1.0e-6);
+  if (u(kFrameIntGrainSublayersEnabled) == 0u || sigma <= 0.4) {
+    return sampleMicroA(int(gid.x), int(gid.y));
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = makeGaussianBlurInfo(sigma, 64);
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    vec4 value = sampleMicroA(x, y);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= int(info.radius); ++offset) {
+      value += weight * (sampleMicroA(x - offset, y) + sampleMicroA(x + offset, y));
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleMicroA(int(gid.x) + offset, int(gid.y));
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 blurMicroY(uvec2 gid) {
+  const float sigma = max(f(kFrameGrainMicroStructureScale), 0.0) / max(f(kFrameFilmPixelSizeUm), 1.0e-6);
+  if (u(kFrameIntGrainSublayersEnabled) == 0u || sigma <= 0.4) {
+    return sampleMicroB(int(gid.x), int(gid.y));
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = makeGaussianBlurInfo(sigma, 64);
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    vec4 value = sampleMicroB(x, y);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= int(info.radius); ++offset) {
+      value += weight * (sampleMicroB(x, y - offset) + sampleMicroB(x, y + offset));
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleMicroB(int(gid.x), int(gid.y) + offset);
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 densityBlurX(uvec2 gid) {
+  const float sigma = max(f(kFrameGrainFinalBlurSigmaPx), 0.0);
+  if (sigma <= 0.0 || (u(kFrameIntGrainSublayersEnabled) == 0u && sigma <= 0.4)) {
+    return sampleSource(int(gid.x), int(gid.y));
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = makeGaussianBlurInfo(sigma, 64);
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    vec4 value = sampleSource(x, y);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= int(info.radius); ++offset) {
+      value += weight * (sampleSource(x - offset, y) + sampleSource(x + offset, y));
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleSource(int(gid.x) + offset, int(gid.y));
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 densityBlurY(uvec2 gid) {
+  const float sigma = max(f(kFrameGrainFinalBlurSigmaPx), 0.0);
+  if (sigma <= 0.0 || (u(kFrameIntGrainSublayersEnabled) == 0u && sigma <= 0.4)) {
+    return sampleSource(int(gid.x), int(gid.y));
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = makeGaussianBlurInfo(sigma, 64);
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    vec4 value = sampleSource(x, y);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= int(info.radius); ++offset) {
+      value += weight * (sampleSource(x, y - offset) + sampleSource(x, y + offset));
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleSource(int(gid.x), int(gid.y) + offset);
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+void main() {
+  const uvec3 activeGid3 = gl_GlobalInvocationID.xyz;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid3.x >= activeWidth || activeGid3.y >= activeHeight) {
+    return;
+  }
+  const uvec3 gid3 = uvec3(activeGid3.xy + uvec2(params.activeOriginX, params.activeOriginY), activeGid3.z);
+  if (gid3.x >= params.width || gid3.y >= params.height) {
+    return;
+  }
+  const uint index = gid3.y * params.width + gid3.x;
+
+  const uint baseSeed = u(kFrameIntGrainSeed) ^ u(kFrameIntGrainFrameSeed);
+  if (params.operation == kOpPreview) {
+    const vec4 source = loadSourcePixel(index);
+    const vec3 grained = previewGrainDensity(source.rgb, outputPixelFilmUm(gid3.xy), baseSeed);
+    storeDestinationPixel(index, vec4(applyGrainControls(source.rgb, grained), source.a));
+    return;
+  }
+
+  if (params.operation == kOpProductionLayers) {
+    if (gid3.z >= 9u) {
+      return;
+    }
+    const uint component = gid3.z;
+    const uint layer = component / 3u;
+    const uint channel = component - layer * 3u;
+    grainLayerA[index * 9u + component] = productionLayerParticleDensity(
+      loadSourcePixel(index).rgb,
+      layer,
+      channel,
+      outputPixelFilmUm(gid3.xy),
+      baseSeed
+    );
+    return;
+  }
+
+  if (params.operation == kOpSynthesisLayers) {
+    if (gid3.z >= 9u) {
+      return;
+    }
+    grainLayerA[index * 9u + gid3.z] = grainSynthesisLayerFromDensity(gid3, baseSeed);
+    return;
+  }
+
+  if (params.operation == kOpLayerBlurX) {
+    if (gid3.z >= 9u) {
+      return;
+    }
+    grainLayerB[index * 9u + gid3.z] = layerBlurX(gid3, true);
+    return;
+  }
+
+  if (params.operation == kOpLayerBlurY) {
+    if (gid3.z >= 9u) {
+      return;
+    }
+    grainLayerA[index * 9u + gid3.z] = layerBlurY(gid3, false);
+    return;
+  }
+
+  if (params.operation == kOpMicroSource) {
+    const float sigma = max(f(kFrameGrainMicroStructureSigmaPx), 0.0);
+    if (u(kFrameIntGrainSublayersEnabled) == 0u || sigma <= 0.05 || f(kFrameGrainMicroStructureScale) <= 0.0) {
+      storeMicroAPixel(index, vec4(1.0));
+      return;
+    }
+    const vec2 filmUm = outputPixelFilmUm(gid3.xy);
+    const uint seed = filmCellSeed(
+      filmUm,
+      max(f(kFrameGrainMicroStructureScale), 1.0e-4),
+      baseSeed ^ 0x23d3c1f1u ^ 0xa349b329u
+    );
+    const float logSigma = sqrt(log(1.0 + sigma * sigma));
+    const float logMean = -0.5 * logSigma * logSigma;
+    storeMicroAPixel(index, vec4(
+      exp(logMean + logSigma * gaussian(seed ^ 0x165667b1u)),
+      exp(logMean + logSigma * gaussian(seed ^ 0x27d4eb2du)),
+      exp(logMean + logSigma * gaussian(seed ^ 0x85ebca6bu)),
+      1.0
+    ));
+    return;
+  }
+
+  if (params.operation == kOpMicroBlurX) {
+    storeMicroBPixel(index, blurMicroX(gid3.xy));
+    return;
+  }
+
+  if (params.operation == kOpMicroBlurY) {
+    storeMicroAPixel(index, blurMicroY(gid3.xy));
+    return;
+  }
+
+  if (params.operation == kOpResolveDensity) {
+    const vec4 source = loadSourcePixel(index);
+    if (u(kFrameIntGrainSublayersEnabled) == 0u) {
+      storeDestinationPixel(index, vec4(
+        max(grainLayerA[index * 9u], 0.0),
+        max(grainLayerA[index * 9u + 1u], 0.0),
+        max(grainLayerA[index * 9u + 2u], 0.0),
+        source.a
+      ));
+      return;
+    }
+    const vec3 densityMin = vec3(channelDensityMin(0u), channelDensityMin(1u), channelDensityMin(2u));
+    vec3 density = vec3(0.0);
+    for (uint layer = 0u; layer < 3u; ++layer) {
+      density.r += grainLayerA[index * 9u + layer * 3u];
+      density.g += grainLayerA[index * 9u + layer * 3u + 1u];
+      density.b += grainLayerA[index * 9u + layer * 3u + 2u];
+    }
+    density *= loadMicroAPixel(index).rgb;
+    storeDestinationPixel(index, vec4(max(density - densityMin, vec3(0.0)), source.a));
+    return;
+  }
+
+  if (params.operation == kOpSynthesisResolveDensity) {
+    const vec4 source = loadSourcePixel(index);
+    storeDestinationPixel(index, vec4(resolveGrainSynthesisDensity(index), source.a));
+    return;
+  }
+
+  if (params.operation == kOpDensityBlurX) {
+    storeDestinationPixel(index, densityBlurX(gid3.xy));
+    return;
+  }
+
+  if (params.operation == kOpDensityBlurY) {
+    storeDestinationPixel(index, densityBlurY(gid3.xy));
+    return;
+  }
+
+  if (params.operation == kOpApplyControls) {
+    const vec4 base = loadSourcePixel(index);
+    const vec4 grained = loadDestinationPixel(index);
+    storeAuxAPixel(index, vec4(applyGrainControls(base.rgb, grained.rgb), grained.a));
+    return;
+  }
+
+  if (params.operation == kOpCopyDensity) {
+    storeAuxAPixel(index, loadDestinationPixel(index));
+  }
+}

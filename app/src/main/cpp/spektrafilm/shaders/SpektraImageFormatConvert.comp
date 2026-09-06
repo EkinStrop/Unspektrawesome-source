@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform image2D image;
+
+layout(std430, binding = 1) buffer Pixels {
+  uint words[];
+};
+
+layout(push_constant) uniform ImageFormatConvertParams {
+  uint pixelCount;
+  uint mode;
+  uint width;
+  uint originX;
+  uint originY;
+} params;
+
+void main() {
+  const uint pixelIndex = gl_GlobalInvocationID.x;
+  if (pixelIndex >= params.pixelCount) {
+    return;
+  }
+
+  const ivec2 coord = ivec2(
+    int(pixelIndex % params.width + params.originX),
+    int(pixelIndex / params.width + params.originY)
+  );
+  const uint wordOffset = pixelIndex * 4u;
+  if (params.mode == 0u) {
+    const vec4 color = imageLoad(image, coord);
+    words[wordOffset] = floatBitsToUint(color.r);
+    words[wordOffset + 1u] = floatBitsToUint(color.g);
+    words[wordOffset + 2u] = floatBitsToUint(color.b);
+    words[wordOffset + 3u] = floatBitsToUint(color.a);
+  } else {
+    const vec2 rg = unpackHalf2x16(words[pixelIndex * 2u]);
+    const vec2 ba = unpackHalf2x16(words[pixelIndex * 2u + 1u]);
+    imageStore(image, coord, vec4(rg, ba));
+  }
+}

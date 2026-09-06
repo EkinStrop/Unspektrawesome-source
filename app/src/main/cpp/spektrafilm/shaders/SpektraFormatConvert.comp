@@ -1,0 +1,90 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SourceWords {
+  uint srcWords[];
+};
+
+layout(std430, binding = 1) writeonly buffer DestinationWords {
+  uint dstWords[];
+};
+
+layout(push_constant) uniform FormatConvertParams {
+  uint pixelCount;
+  uint mode;
+} params;
+
+uint hashUint(uint value) {
+  value ^= value >> 16u;
+  value *= 0x7feb352du;
+  value ^= value >> 15u;
+  value *= 0x846ca68bu;
+  value ^= value >> 16u;
+  return value;
+}
+
+float hashUnitFloat(uint value) {
+  return float(hashUint(value) & 0x00ffffffu) * (1.0 / 16777216.0);
+}
+
+float halfUlp(float value) {
+  const float magnitude = abs(value);
+  if (isnan(magnitude) || isinf(magnitude) || magnitude >= 65504.0) {
+    return 0.0;
+  }
+  if (magnitude < 6.103515625e-5) {
+    return 5.960464477539063e-8;
+  }
+  return exp2(floor(log2(magnitude)) - 10.0);
+}
+
+float ditherTpdfForHalf(uint pixelIndex) {
+  const uint seed = pixelIndex * 747796405u + 0x9e3779b9u;
+  return 0.5 * (hashUnitFloat(seed) + hashUnitFloat(seed ^ 0x85ebca6bu) - 1.0);
+}
+
+float ditherForHalf(float value, float tpdf) {
+  return value + tpdf * halfUlp(value);
+}
+
+vec3 ditherRgbForHalf(vec3 rgb, uint pixelIndex) {
+  const float tpdf = ditherTpdfForHalf(pixelIndex);
+  return vec3(
+    ditherForHalf(rgb.r, tpdf),
+    ditherForHalf(rgb.g, tpdf),
+    ditherForHalf(rgb.b, tpdf)
+  );
+}
+
+void main() {
+  const uint pixelIndex = gl_GlobalInvocationID.x;
+  if (pixelIndex >= params.pixelCount) {
+    return;
+  }
+
+  if (params.mode == 0u) {
+    const uint halfWordOffset = pixelIndex * 2u;
+    const vec2 rg = unpackHalf2x16(srcWords[halfWordOffset]);
+    const vec2 ba = unpackHalf2x16(srcWords[halfWordOffset + 1u]);
+    const uint floatWordOffset = pixelIndex * 4u;
+    dstWords[floatWordOffset] = floatBitsToUint(rg.x);
+    dstWords[floatWordOffset + 1u] = floatBitsToUint(rg.y);
+    dstWords[floatWordOffset + 2u] = floatBitsToUint(ba.x);
+    dstWords[floatWordOffset + 3u] = floatBitsToUint(ba.y);
+  } else {
+    const uint floatWordOffset = pixelIndex * 4u;
+    const vec2 rg = vec2(
+      uintBitsToFloat(srcWords[floatWordOffset]),
+      uintBitsToFloat(srcWords[floatWordOffset + 1u])
+    );
+    const vec2 ba = vec2(
+      uintBitsToFloat(srcWords[floatWordOffset + 2u]),
+      uintBitsToFloat(srcWords[floatWordOffset + 3u])
+    );
+    const vec3 rgb = ditherRgbForHalf(vec3(rg, ba.x), pixelIndex);
+    const uint halfWordOffset = pixelIndex * 2u;
+    dstWords[halfWordOffset] = packHalf2x16(rgb.rg);
+    dstWords[halfWordOffset + 1u] = packHalf2x16(vec2(rgb.b, ba.y));
+  }
+}

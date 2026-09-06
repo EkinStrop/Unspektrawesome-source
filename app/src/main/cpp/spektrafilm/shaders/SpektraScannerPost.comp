@@ -1,0 +1,600 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+const uint kOpPrintGlareGenerate = 0u;
+const uint kOpPrintGlareBlurX = 1u;
+const uint kOpPrintGlareBlurY = 2u;
+const uint kOpPrintGlareApply = 3u;
+const uint kOpScannerBlurX = 4u;
+const uint kOpScannerBlurY = 5u;
+const uint kOpUnsharpBlurX = 6u;
+const uint kOpUnsharpBlurY = 7u;
+const uint kOpFinalize = 8u;
+const uint kOutputRoleDisplaySdr = 0u;
+const uint kOutputRoleDisplayHdr = 1u;
+const uint kOutputRoleRcm = 2u;
+const uint kLinearRec2020ColorSpace = 14u;
+
+const uint kFrameColorEncodeMin = 22u;
+const uint kFrameColorEncodeMax = 23u;
+const uint kFrameScannerBlurSigmaPx = 40u;
+const uint kFrameScannerUnsharpSigmaPx = 41u;
+const uint kFrameScannerUnsharpAmount = 42u;
+const uint kFrameGlarePercent = 43u;
+const uint kFrameGlareRoughness = 44u;
+const uint kFrameGlareBlur = 45u;
+const uint kFrameGlareRgbR = 46u;
+const uint kFrameGlareRgbG = 47u;
+const uint kFrameGlareRgbB = 48u;
+const uint kFrameHdrReferenceWhiteNits = 72u;
+const uint kFrameHdrPeakNits = 73u;
+const uint kFrameHdrExposureEv = 74u;
+
+const uint kFrameIntOutputColorSpace = 1u;
+const uint kFrameIntOutputRole = 2u;
+const uint kFrameIntGrainSeed = 16u;
+const uint kFrameIntHdrTransfer = 20u;
+const uint kFrameIntHdrToneMapping = 21u;
+const uint kFrameIntColorAdaptationFlags = 27u;
+const uint kColorAdaptationOutputLightnessCompression = 1u << 2u;
+const uint kColorAdaptationOutputChromaCompression = 1u << 3u;
+const uint kOutputGamutCompressionStride = 18u;
+const uint kTransferLinear = 0u;
+const uint kTransferSrgb = 2u;
+const uint kTransferGamma = 3u;
+const uint kTransferProPhoto = 4u;
+
+layout(std430, binding = 0) readonly buffer SourcePixels {
+  vec4 sourcePixels[];
+};
+
+layout(std430, binding = 1) buffer TempPixels {
+  vec4 tempPixels[];
+};
+
+layout(std430, binding = 2) readonly buffer UnsharpPixels {
+  vec4 unsharpPixels[];
+};
+
+layout(std430, binding = 3) buffer DestinationPixels {
+  vec4 destinationPixels[];
+};
+
+layout(std430, binding = 6) readonly buffer ColorTransferKinds {
+  uint colorTransferKinds[];
+};
+
+layout(std430, binding = 25) readonly buffer ColorEncodeLuts {
+  float colorEncodeLuts[];
+};
+
+layout(std430, binding = 27) readonly buffer FrameFloats {
+  float frameFloats[];
+};
+
+layout(std430, binding = 28) readonly buffer FrameInts {
+  uint frameInts[];
+};
+
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint operation;
+  uint _pad1;
+  uint _pad2;
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+
+vec4 loadSourcePixel(uint index) { return sourcePixels[index]; }
+vec4 loadTempPixel(uint index) { return tempPixels[index]; }
+vec4 loadUnsharpPixel(uint index) { return unsharpPixels[index]; }
+void storeTempPixel(uint index, vec4 value) { tempPixels[index] = value; }
+void storeDestinationPixel(uint index, vec4 value) { destinationPixels[index] = value; }
+
+float f(uint index) {
+  return frameFloats[index];
+}
+
+uint u(uint index) {
+  return frameInts[index];
+}
+
+bool colorAdaptationEnabled(uint flag) {
+  return (u(kFrameIntColorAdaptationFlags) & flag) != 0u;
+}
+
+uint colorSpaceIndex(uint colorSpace) {
+  return min(colorSpace, max(params.colorSpaceCount, 1u) - 1u);
+}
+
+uint finalOutputColorSpace() {
+  return u(kFrameIntOutputRole) == kOutputRoleDisplayHdr
+    ? colorSpaceIndex(kLinearRec2020ColorSpace)
+    : colorSpaceIndex(u(kFrameIntOutputColorSpace));
+}
+
+uint safeIndex(int index, uint size) {
+  if (size <= 1u) {
+    return 0u;
+  }
+  return uint(clamp(index, 0, int(size) - 1));
+}
+
+uvec2 absolutePixel(uvec2 gid) {
+  return gid + uvec2(params.tileOriginX, params.tileOriginY);
+}
+
+vec4 sampleSource(int x, int y) {
+  const uint sx = safeIndex(x, params.width);
+  const uint sy = safeIndex(y, params.height);
+  return loadSourcePixel(sy * params.width + sx);
+}
+
+float gaussianWeight(float offset, float sigma) {
+  return exp(-0.5 * (offset * offset) / max(sigma * sigma, 1.0e-8));
+}
+
+vec4 gaussianSampleX(uvec2 gid, float sigma) {
+  if (sigma <= 1.0e-4) {
+    return sampleSource(int(gid.x), int(gid.y));
+  }
+
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleSource(int(gid.x) + offset, int(gid.y));
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 gaussianSampleY(uvec2 gid, float sigma) {
+  if (sigma <= 1.0e-4) {
+    return sampleSource(int(gid.x), int(gid.y));
+  }
+
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleSource(int(gid.x), int(gid.y) + offset);
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+float hash01(uvec2 p, uint seed) {
+  uint x = p.x * 1664525u + p.y * 1013904223u + seed * 747796405u + 2891336453u;
+  x ^= x >> 16u;
+  x *= 2246822519u;
+  x ^= x >> 13u;
+  x *= 3266489917u;
+  x ^= x >> 16u;
+  return (float(x & 0x00ffffffu) + 0.5) / 16777216.0;
+}
+
+float lognormalFromMeanStd(float mean, float stddev, uvec2 gid, uint seed) {
+  mean = max(mean, 0.0);
+  stddev = max(stddev, 0.0);
+  if (mean <= 0.0) {
+    return 0.0;
+  }
+  if (stddev <= 1.0e-10) {
+    return mean;
+  }
+  const float varianceRatio = (stddev * stddev) / max(mean * mean, 1.0e-20);
+  const float sigma2 = log(1.0 + varianceRatio);
+  const float sigma = sqrt(max(sigma2, 0.0));
+  const float mu = log(mean) - 0.5 * sigma2;
+  const float u1 = max(hash01(gid, seed), 1.0e-7);
+  const float u2 = hash01(uvec2(gid.y, gid.x), seed ^ 0x9e3779b9u);
+  const float normal = sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
+  return exp(mu + sigma * normal);
+}
+
+float sampleColorEncodeLutRange(float value, uint colorSpace, float rangeMin, float rangeMax, const uint lutSize) {
+  const float range = max(rangeMax - rangeMin, 1.0e-6);
+  const float step = range / float(lutSize - 1u);
+  const uint offset = colorSpace * lutSize;
+  if (value <= rangeMin) {
+    const float y0 = colorEncodeLuts[offset];
+    const float y1 = colorEncodeLuts[offset + 1u];
+    return y0 + (value - rangeMin) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+  if (value >= rangeMax) {
+    const float y0 = colorEncodeLuts[offset + lutSize - 2u];
+    const float y1 = colorEncodeLuts[offset + lutSize - 1u];
+    return y1 + (value - rangeMax) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+  const float position = ((value - rangeMin) / range) * float(lutSize - 1u);
+  const uint lo = uint(floor(position));
+  const uint hi = min(lo + 1u, lutSize - 1u);
+  const float t = position - float(lo);
+  return mix(colorEncodeLuts[offset + lo], colorEncodeLuts[offset + hi], t);
+}
+
+float colorTransferParam(uint colorSpace) {
+  const uint offset = params.colorSpaceCount * (params.transferLutSize + kOutputGamutCompressionStride);
+  return colorEncodeLuts[offset + colorSpace];
+}
+
+float signedSrgbEncode(float value) {
+  const float x = abs(value);
+  const float y = x <= 0.0031308
+    ? 12.92 * x
+    : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+  return value < 0.0 ? -y : y;
+}
+
+float signedGammaEncode(float value, float gamma) {
+  const float y = pow(abs(value), 1.0 / max(gamma, 1.0e-6));
+  return value < 0.0 ? -y : y;
+}
+
+float signedProPhotoEncode(float value) {
+  const float x = abs(value);
+  const float y = x < (1.0 / 512.0) ? 16.0 * x : pow(x, 1.0 / 1.8);
+  return value < 0.0 ? -y : y;
+}
+
+vec3 signedSrgbEncode(vec3 rgb) {
+  return vec3(
+    signedSrgbEncode(rgb.r),
+    signedSrgbEncode(rgb.g),
+    signedSrgbEncode(rgb.b)
+  );
+}
+
+vec3 signedGammaEncode(vec3 rgb, float gamma) {
+  return vec3(
+    signedGammaEncode(rgb.r, gamma),
+    signedGammaEncode(rgb.g, gamma),
+    signedGammaEncode(rgb.b, gamma)
+  );
+}
+
+vec3 signedProPhotoEncode(vec3 rgb) {
+  return vec3(
+    signedProPhotoEncode(rgb.r),
+    signedProPhotoEncode(rgb.g),
+    signedProPhotoEncode(rgb.b)
+  );
+}
+
+vec3 encodeOutputRgb(vec3 rgb) {
+  const uint colorSpace = finalOutputColorSpace();
+  const uint transferKind = colorTransferKinds[colorSpace];
+  if (transferKind == kTransferLinear) {
+    return rgb;
+  }
+  if (transferKind == kTransferSrgb) {
+    return signedSrgbEncode(rgb);
+  }
+  if (transferKind == kTransferGamma) {
+    return signedGammaEncode(rgb, colorTransferParam(colorSpace));
+  }
+  if (transferKind == kTransferProPhoto) {
+    return signedProPhotoEncode(rgb);
+  }
+  const uint lutSize = max(params.transferLutSize, 2u);
+  return vec3(
+    sampleColorEncodeLutRange(rgb.r, colorSpace, f(kFrameColorEncodeMin), f(kFrameColorEncodeMax), lutSize),
+    sampleColorEncodeLutRange(rgb.g, colorSpace, f(kFrameColorEncodeMin), f(kFrameColorEncodeMax), lutSize),
+    sampleColorEncodeLutRange(rgb.b, colorSpace, f(kFrameColorEncodeMin), f(kFrameColorEncodeMax), lutSize)
+  );
+}
+
+float rec2020Luminance(vec3 rgb) {
+  return dot(rgb, vec3(0.2627, 0.6780, 0.0593));
+}
+
+vec3 hdrApplyLuminanceToneMap(vec3 rgb) {
+  const float referenceWhite = max(f(kFrameHdrReferenceWhiteNits), 1.0);
+  const float peak = max(f(kFrameHdrPeakNits), referenceWhite + 1.0);
+  vec3 nits = rgb * (referenceWhite * exp2(f(kFrameHdrExposureEv)));
+  const float sourceY = rec2020Luminance(nits);
+  if (!(sourceY > 1.0e-6) || isnan(sourceY) || isinf(sourceY)) {
+    return vec3(0.0);
+  }
+  float mappedY = sourceY;
+  if (u(kFrameIntHdrToneMapping) == 1u) {
+    mappedY = min(sourceY, peak);
+  } else if (sourceY > referenceWhite) {
+    const float shoulder = max(peak - referenceWhite, 1.0);
+    mappedY = referenceWhite + shoulder * (1.0 - exp(-(sourceY - referenceWhite) / shoulder));
+  }
+  return nits * (mappedY / sourceY);
+}
+
+float encodePq(float nits) {
+  const float m1 = 2610.0 / 16384.0;
+  const float m2 = 2523.0 / 32.0;
+  const float c1 = 3424.0 / 4096.0;
+  const float c2 = 2413.0 / 128.0;
+  const float c3 = 2392.0 / 128.0;
+  const float y = pow(max(nits, 0.0) / 10000.0, m1);
+  return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
+}
+
+float encodeHlg(float sceneLinear) {
+  const float a = 0.17883277;
+  const float b = 1.0 - 4.0 * a;
+  const float c = 0.55991073;
+  const float e = max(sceneLinear, 0.0);
+  return e <= (1.0 / 12.0) ? sqrt(3.0 * e) : a * log(12.0 * e - b) + c;
+}
+
+float hlgSystemGamma(float peakNits) {
+  return max(1.0 + 0.42 * log(max(peakNits, 1.0) / 1000.0) / log(10.0), 1.0e-6);
+}
+
+float hlgChannelToSignal(float nits, float peakNits, bool clampToPeak) {
+  const float normalized = max(nits, 0.0) / peakNits;
+  return clampToPeak ? clamp(normalized, 0.0, 1.0) : normalized;
+}
+
+vec3 hlgDisplayNitsToSignal(vec3 nits, float peakNits, bool clampToPeak) {
+  const float gamma = hlgSystemGamma(peakNits);
+  return vec3(
+    encodeHlg(pow(hlgChannelToSignal(nits.r, peakNits, clampToPeak), 1.0 / gamma)),
+    encodeHlg(pow(hlgChannelToSignal(nits.g, peakNits, clampToPeak), 1.0 / gamma)),
+    encodeHlg(pow(hlgChannelToSignal(nits.b, peakNits, clampToPeak), 1.0 / gamma))
+  );
+}
+
+// Native port of Andrea Volpato's spektrafilm/forum OKLch output compression.
+float reinhardKnee(float value, float threshold, float limit, float power) {
+  if (isnan(value) || isinf(value) || value <= threshold) {
+    return value;
+  }
+  const float scale = max(limit - threshold, 1.0e-12);
+  const float x = (value - threshold) / scale;
+  const float y = x / pow(1.0 + pow(x, power), 1.0 / power);
+  return threshold + scale * y;
+}
+
+float signedCuberoot(float value) {
+  return value < 0.0 ? -pow(-value, 1.0 / 3.0) : pow(value, 1.0 / 3.0);
+}
+
+vec3 multiplyPackedColorMatrix(uint offset, vec3 value) {
+  return vec3(
+    colorEncodeLuts[offset] * value.r + colorEncodeLuts[offset + 1u] * value.g + colorEncodeLuts[offset + 2u] * value.b,
+    colorEncodeLuts[offset + 3u] * value.r + colorEncodeLuts[offset + 4u] * value.g + colorEncodeLuts[offset + 5u] * value.b,
+    colorEncodeLuts[offset + 6u] * value.r + colorEncodeLuts[offset + 7u] * value.g + colorEncodeLuts[offset + 8u] * value.b
+  );
+}
+
+vec3 oklabFromOutputRgb(vec3 rgb, uint dataOffset) {
+  const vec3 lms = multiplyPackedColorMatrix(dataOffset, rgb);
+  const vec3 lmsPrime = vec3(
+    signedCuberoot(lms.r),
+    signedCuberoot(lms.g),
+    signedCuberoot(lms.b)
+  );
+  const vec3 row0 = vec3(0.2104542553, 0.7936177850, -0.0040720468);
+  const vec3 row1 = vec3(1.9779984951, -2.4285922050, 0.4505937099);
+  const vec3 row2 = vec3(0.0259040371, 0.7827717662, -0.8086757660);
+  return vec3(dot(row0, lmsPrime), dot(row1, lmsPrime), dot(row2, lmsPrime));
+}
+
+vec3 outputRgbFromOklab(vec3 lab, uint dataOffset) {
+  const vec3 invRow0 = vec3(1.0, 0.3963377774, 0.2158037573);
+  const vec3 invRow1 = vec3(1.0, -0.1055613458, -0.0638541728);
+  const vec3 invRow2 = vec3(1.0, -0.0894841775, -1.2914855480);
+  const vec3 lmsPrime = vec3(dot(invRow0, lab), dot(invRow1, lab), dot(invRow2, lab));
+  const vec3 lms = lmsPrime * lmsPrime * lmsPrime;
+  return multiplyPackedColorMatrix(dataOffset + 9u, lms);
+}
+
+bool rgbInBounds(vec3 rgb, float lowerBound, float upperBound) {
+  const float epsilon = 1.0e-6;
+  return !any(isnan(rgb)) &&
+    !any(isinf(rgb)) &&
+    all(greaterThanEqual(rgb, vec3(lowerBound - epsilon))) &&
+    all(lessThanEqual(rgb, vec3(upperBound + epsilon)));
+}
+
+float solveOklchCmax(vec3 lab, float chroma, vec2 hueUnit, uint dataOffset, float lowerBound, float upperBound) {
+  float lo = 0.0;
+  float hi = max(chroma, 1.0e-6);
+  const float maxHi = 4.0 * max(upperBound, 1.0);
+  for (uint expansion = 0u; expansion < 12u; ++expansion) {
+    const vec3 candidate = outputRgbFromOklab(vec3(lab.x, hueUnit.x * hi, hueUnit.y * hi), dataOffset);
+    if (!rgbInBounds(candidate, lowerBound, upperBound)) {
+      break;
+    }
+    lo = hi;
+    hi = min(hi * 2.0, maxHi);
+    if (hi >= maxHi) {
+      break;
+    }
+  }
+  for (uint iteration = 0u; iteration < 16u; ++iteration) {
+    const float mid = 0.5 * (lo + hi);
+    const vec3 candidate = outputRgbFromOklab(vec3(lab.x, hueUnit.x * mid, hueUnit.y * mid), dataOffset);
+    if (rgbInBounds(candidate, lowerBound, upperBound)) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+vec3 outputGamutCompressOklch(
+  vec3 rgb,
+  uint colorSpace,
+  float lowerBound,
+  float upperBound,
+  bool softenInGamut,
+  bool compressLightness,
+  bool compressChroma
+) {
+  if (any(isnan(rgb)) || any(isinf(rgb))) {
+    return vec3(lowerBound);
+  }
+  const bool inBounds = rgbInBounds(rgb, lowerBound, upperBound);
+  if (inBounds && !softenInGamut) {
+    return rgb;
+  }
+  const uint dataOffset =
+    params.colorSpaceCount * params.transferLutSize + colorSpace * kOutputGamutCompressionStride;
+  vec3 lab = oklabFromOutputRgb(rgb, dataOffset);
+  if (compressLightness) {
+    lab.x = softenInGamut
+      ? reinhardKnee(max(lab.x, 0.0), 0.7, 1.0, 2.2)
+      : clamp(lab.x, 0.0, pow(max(upperBound, 0.0), 1.0 / 3.0));
+  }
+  const float chroma = length(lab.yz);
+  if (!(chroma > 1.0e-10) || isnan(chroma) || isinf(chroma)) {
+    if (inBounds) {
+      return rgb;
+    }
+    return clamp(outputRgbFromOklab(vec3(lab.x, 0.0, 0.0), dataOffset), vec3(lowerBound), vec3(upperBound));
+  }
+  if (!compressChroma) {
+    const vec3 lightnessCompressed = outputRgbFromOklab(lab, dataOffset);
+    return rgbInBounds(lightnessCompressed, lowerBound, upperBound)
+      ? lightnessCompressed
+      : clamp(lightnessCompressed, vec3(lowerBound), vec3(upperBound));
+  }
+  const vec2 hueUnit = lab.yz / chroma;
+  const float cmax = max(solveOklchCmax(lab, chroma, hueUnit, dataOffset, lowerBound, upperBound), 1.0e-9);
+  const float normalizedChroma = chroma / cmax;
+  const float compressedNormalized = softenInGamut
+    ? reinhardKnee(normalizedChroma, 0.0, 1.0, 6.0)
+    : (normalizedChroma <= 1.0 ? normalizedChroma : reinhardKnee(normalizedChroma, 0.85, 1.0, 4.0));
+  const float compressedChroma = min(compressedNormalized * cmax, cmax);
+  const vec3 compressed = outputRgbFromOklab(vec3(lab.x, hueUnit.x * compressedChroma, hueUnit.y * compressedChroma), dataOffset);
+  return rgbInBounds(compressed, lowerBound, upperBound)
+    ? compressed
+    : clamp(compressed, vec3(lowerBound), vec3(upperBound));
+}
+
+vec3 outputGamutCompressDisplaySdr(vec3 rgb) {
+  const bool compressLightness = colorAdaptationEnabled(kColorAdaptationOutputLightnessCompression);
+  const bool compressChroma = colorAdaptationEnabled(kColorAdaptationOutputChromaCompression);
+  if ((!compressLightness && !compressChroma) || u(kFrameIntOutputRole) != kOutputRoleDisplaySdr) {
+    return rgb;
+  }
+  return outputGamutCompressOklch(rgb, finalOutputColorSpace(), 0.0, 1.0, true, compressLightness, compressChroma);
+}
+
+vec3 finalizeOutputRgb(vec3 rgb) {
+  if (u(kFrameIntOutputRole) == kOutputRoleDisplayHdr) {
+    const float peak = max(f(kFrameHdrPeakNits), max(f(kFrameHdrReferenceWhiteNits), 1.0) + 1.0);
+    const bool compressLightness = colorAdaptationEnabled(kColorAdaptationOutputLightnessCompression);
+    const bool compressChroma = colorAdaptationEnabled(kColorAdaptationOutputChromaCompression);
+    const bool compressOutputGamut = compressLightness || compressChroma;
+    vec3 nits = hdrApplyLuminanceToneMap(compressOutputGamut ? rgb : max(rgb, vec3(0.0)));
+    if (compressOutputGamut) {
+      nits = outputGamutCompressOklch(
+        nits / peak,
+        finalOutputColorSpace(),
+        0.0,
+        1.0,
+        false,
+        compressLightness,
+        compressChroma
+      ) * peak;
+      nits = clamp(nits, vec3(0.0), vec3(peak));
+    } else {
+      nits = max(nits, vec3(0.0));
+    }
+    return u(kFrameIntHdrTransfer) == 1u
+      ? hlgDisplayNitsToSignal(nits, peak, compressOutputGamut)
+      : vec3(encodePq(nits.r), encodePq(nits.g), encodePq(nits.b));
+  }
+  if (u(kFrameIntOutputRole) == kOutputRoleRcm) {
+    return encodeOutputRgb(rgb);
+  }
+  return encodeOutputRgb(outputGamutCompressDisplaySdr(rgb));
+}
+
+void main() {
+  const uvec2 activeGid = gl_GlobalInvocationID.xy;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {
+    return;
+  }
+
+  const uvec2 gid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (gid.x >= params.width || gid.y >= params.height) {
+    return;
+  }
+  const uint index = gid.y * params.width + gid.x;
+  if (params.operation == kOpPrintGlareGenerate) {
+    const float mean = max(f(kFrameGlarePercent), 0.0);
+    const float stddev = max(f(kFrameGlareRoughness), 0.0) * mean;
+    const float amount = lognormalFromMeanStd(mean, stddev, absolutePixel(gid), u(kFrameIntGrainSeed));
+    storeTempPixel(index, vec4(amount, amount, amount, 1.0));
+    return;
+  }
+  if (params.operation == kOpPrintGlareBlurX) {
+    storeTempPixel(index, gaussianSampleX(gid, max(f(kFrameGlareBlur), 0.0)));
+    return;
+  }
+  if (params.operation == kOpPrintGlareBlurY) {
+    storeTempPixel(index, gaussianSampleY(gid, max(f(kFrameGlareBlur), 0.0)));
+    return;
+  }
+  if (params.operation == kOpPrintGlareApply) {
+    vec4 pixel = loadSourcePixel(index);
+    const vec3 glareRgb = vec3(f(kFrameGlareRgbR), f(kFrameGlareRgbG), f(kFrameGlareRgbB));
+    pixel.rgb += max(loadTempPixel(index).r, 0.0) * 0.01 * glareRgb;
+    storeDestinationPixel(index, pixel);
+    return;
+  }
+  if (params.operation == kOpScannerBlurX) {
+    storeTempPixel(index, gaussianSampleX(gid, max(f(kFrameScannerBlurSigmaPx), 0.0)));
+    return;
+  }
+  if (params.operation == kOpScannerBlurY) {
+    storeTempPixel(index, gaussianSampleY(gid, max(f(kFrameScannerBlurSigmaPx), 0.0)));
+    return;
+  }
+  if (params.operation == kOpUnsharpBlurX) {
+    storeTempPixel(index, gaussianSampleX(gid, max(f(kFrameScannerUnsharpSigmaPx), 0.0)));
+    return;
+  }
+  if (params.operation == kOpUnsharpBlurY) {
+    storeTempPixel(index, gaussianSampleY(gid, max(f(kFrameScannerUnsharpSigmaPx), 0.0)));
+    return;
+  }
+  if (params.operation == kOpFinalize) {
+    vec4 pixel = loadSourcePixel(index);
+    if (f(kFrameScannerUnsharpSigmaPx) > 0.0 && f(kFrameScannerUnsharpAmount) > 0.0) {
+      const vec3 blurred = loadUnsharpPixel(index).rgb;
+      const vec3 sourceRgb = pixel.rgb;
+      pixel.rgb = max(sourceRgb + f(kFrameScannerUnsharpAmount) * (sourceRgb - blurred), min(sourceRgb, vec3(0.0)));
+    }
+    pixel.rgb = finalizeOutputRgb(pixel.rgb);
+    storeDestinationPixel(index, pixel);
+  }
+}
